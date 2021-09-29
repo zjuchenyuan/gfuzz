@@ -1,0 +1,20 @@
+FROM zjuchenyuan/gollvm
+
+ENV COMMIT release-20210125.0
+
+RUN git clone https://github.com/google/gvisor /gvisor &&\
+    cd /gvisor &&\
+    git checkout $COMMIT &&\
+    curl -fsSL https://bazel.build/bazel-release.pub.gpg | gpg --dearmor > bazel.gpg &&\
+    mv bazel.gpg /etc/apt/trusted.gpg.d/ &&\
+    echo "deb [arch=amd64] https://storage.googleapis.com/bazel-apt stable jdk1.8" > /etc/apt/sources.list.d/bazel.list &&\
+    apt update && apt install -y bazel-3.7.0 &&\
+    ln -s /usr/bin/bazel-3.7.0 /usr/bin/bazel
+
+ADD scripts/build/buildrunsc.sh /g/scripts/build/
+ADD scripts/build/packtmpr.py /g/scripts/build/
+ADD scripts/build/rewritebuilder.py /g/scripts/build/
+
+RUN ln -s /usr/bin/python3 /usr/bin/python &&\
+    apt install -y zip unzip &&\
+    cd /gvisor && /g/scripts/build/buildrunsc.sh $COMMIT
