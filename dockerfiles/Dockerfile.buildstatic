@@ -18,3 +18,22 @@ ADD scripts/build/rewritebuilder.py /g/scripts/build/
 RUN ln -s /usr/bin/python3 /usr/bin/python &&\
     apt install -y zip unzip &&\
     cd /gvisor && /g/scripts/build/buildrunsc.sh $COMMIT
+
+ADD scripts/build/gocallvis_edgeprint.patch /g/scripts/build/
+ADD scripts/build/gocallvis_rta.patch /g/scripts/build/
+
+RUN wget -q https://golang.org/dl/go1.15.3.linux-amd64.tar.gz &&\
+    tar xf go1.15.3.linux-amd64.tar.gz &&\
+    git clone https://github.com/ofabry/go-callvis &&\
+    cd go-callvis && git checkout 71bdc75 &&\
+    git apply /g/scripts/build/gocallvis_edgeprint.patch &&\
+    /go/bin/go build && mv go-callvis /g/go-callvis &&\
+    git apply /g/scripts/build/gocallvis_rta.patch &&\
+    /go/bin/go build && mv go-callvis /g/go-callvis.rta
+ADD scripts/build/coverage.go /g/scripts/build/
+ADD scripts/build/r2gopath.py /g/scripts/build/
+ADD scripts/build/buildgopath.sh /g/scripts/build/
+RUN cd /gvisor && PATH=/go/bin:$PATH /g/scripts/build/buildgopath.sh $COMMIT
+ADD scripts/build/buildllvmir.sh /g/scripts/build/
+ADD scripts/build/buildlog_rewrite.py /g/scripts/build/
+RUN /g/scripts/build/buildllvmir.sh $COMMIT
