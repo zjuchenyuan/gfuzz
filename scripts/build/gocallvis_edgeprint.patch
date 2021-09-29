@@ -1,0 +1,74 @@
+From ee484a50cfb6e3a11021ff15b518cabac9785cd0 Mon Sep 17 00:00:00 2001
+From: zjchenyuan <chenyuan.gfuzz@qiushi.ac.cn>
+Date: Wed, 26 May 2021 23:16:10 +0800
+Subject: [PATCH] [gfuzz] add EDGE print as needed
+
+---
+ main.go   | 8 +-------
+ output.go | 6 +++++-
+ 2 files changed, 6 insertions(+), 8 deletions(-)
+
+diff --git a/main.go b/main.go
+index 2d03cee..c71eaab 100644
+--- a/main.go
++++ b/main.go
+@@ -100,17 +100,11 @@ func outputDot(fname string, outputFormat string) {
+ 
+ 	log.Println("writing dot output..")
+ 
+-	writeErr := ioutil.WriteFile(fmt.Sprintf("%s.gv", fname), output, 0755)
++	writeErr := ioutil.WriteFile(fname, output, 0755)
+ 	if writeErr != nil {
+ 		log.Fatalf("%v\n", writeErr)
+ 	}
+ 
+-	log.Printf("converting dot to %s..\n", outputFormat)
+-
+-	_, err = dotToImage(fname, outputFormat, output)
+-	if err != nil {
+-		log.Fatalf("%v\n", err)
+-	}
+ }
+ 
+ //noinspection GoUnhandledErrorResult
+diff --git a/output.go b/output.go
+index 6c84fce..58acf1f 100644
+--- a/output.go
++++ b/output.go
+@@ -33,6 +33,7 @@ func printOutput(
+ 	nostd,
+ 	nointer bool,
+ ) ([]byte, error) {
++var buf bytes.Buffer
+ 	var groupType, groupPkg bool
+ 	for _, g := range groupBy {
+ 		if g == "pkg" {
+@@ -151,6 +152,8 @@ func printOutput(
+ 		//fileCaller := fmt.Sprintf("%s:%d", posCaller.Filename, posCaller.Line)
+ 		filenameCaller := filepath.Base(posCaller.Filename)
+ 
++fmt.Fprintf(&buf, "EDGE\t%v\t%v\t%v\t%v\n", caller.Func, callee.Func, posEdge.Filename, posEdge.Line)
++
+ 		// omit synthetic calls
+ 		if isSynthetic(edge) {
+ 			return nil
+@@ -404,6 +407,7 @@ func printOutput(
+ 
+ 		return nil
+ 	})
++	return buf.Bytes(), nil
+ 	if err != nil {
+ 		return nil, err
+ 	}
+@@ -433,7 +437,7 @@ func printOutput(
+ 		},
+ 	}
+ 
+-	var buf bytes.Buffer
++	
+ 	if err := dot.WriteDot(&buf); err != nil {
+ 		return nil, err
+ 	}
+-- 
+2.17.1
+
