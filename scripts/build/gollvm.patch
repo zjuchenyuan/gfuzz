@@ -15,17 +15,17 @@ index f42679d2..30342366 100644
 +++ b/libgo/go/syscall/socket.go
 @@ -435,11 +435,11 @@ func SendmsgN(fd int, p, oob []byte, to Sockaddr, flags int) (n int, err error)
  //shutdown(fd _C_int, how _C_int) _C_int
-
+ 
  func (iov *Iovec) SetLen(length int) {
--       iov.Len = Iovec_len_t(length)
-+       iov.Len = uint64(length)
+-	iov.Len = Iovec_len_t(length)
++	iov.Len = uint64(length)
  }
-
+ 
  func (msghdr *Msghdr) SetControllen(length int) {
--       msghdr.Controllen = Msghdr_controllen_t(length)
-+       msghdr.Controllen = uint64(length)
+-	msghdr.Controllen = Msghdr_controllen_t(length)
++	msghdr.Controllen = uint64(length)
  }
-
+ 
  func (cmsg *Cmsghdr) SetLen(length int) {
 diff --git a/libgo/mksysinfo.sh b/libgo/mksysinfo.sh
 index deac5ce8..bea5ec35 100755
@@ -38,7 +38,7 @@ index deac5ce8..bea5ec35 100755
 -      -e 's/iov_len *[a-zA-Z0-9_]*/Len Iovec_len_t/' \
 +      -e 's/iov_len *[a-zA-Z0-9_]*/Len uint64/' \
      >> ${OUT}
-
+ 
  # The msghdr struct.
 @@ -632,7 +632,7 @@ echo $msghdr | \
        -e 's/msg_iovlen/Iovlen/' \
@@ -48,7 +48,7 @@ index deac5ce8..bea5ec35 100755
 +      -e 's/msg_controllen *[a-zA-Z0-9_]*/Controllen uint64/' \
        -e 's/msg_flags/Flags/' \
      >> ${OUT}
-
+ 
 @@ -806,16 +806,16 @@ if ! grep '^const TIOCSPGRP' ${OUT} >/dev/null 2>&1; then
      echo 'const TIOCSPGRP = _TIOCSPGRP_val' >> ${OUT}
    fi
@@ -76,7 +76,7 @@ index deac5ce8..bea5ec35 100755
  if ! grep '^const TIOCGDEV' ${OUT} >/dev/null 2>&1; then
    if grep '^const _TIOCGDEV_val' ${OUT} >/dev/null 2>&1; then
      echo 'const TIOCGDEV = _TIOCGDEV_val' >> ${OUT}
---
+-- 
 2.17.1
 
 
@@ -96,7 +96,7 @@ index bea5ec35..5210004a 100755
 @@ -839,11 +839,11 @@ if ! grep '^const TUNSETDEBUG' ${OUT} >/dev/null 2>&1; then
    fi
  fi
-
+ 
 -if ! grep '^const TUNSETIFF' ${OUT} >/dev/null 2>&1; then
 -  if grep '^const _TUNSETIFF_val' ${OUT} >/dev/null 2>&1; then
 -    echo 'const TUNSETIFF = _TUNSETIFF_val' >> ${OUT}
@@ -107,8 +107,9 @@ index bea5ec35..5210004a 100755
 +    echo 'const TUNSETIFF = 1074025674' >> ${OUT}
 +#  fi
 +#fi
-
+ 
  if ! grep '^const TUNSETPERSIST' ${OUT} >/dev/null 2>&1; then
    if grep '^const _TUNSETPERSIST_val' ${OUT} >/dev/null 2>&1; then
---
+-- 
 2.17.1
+
