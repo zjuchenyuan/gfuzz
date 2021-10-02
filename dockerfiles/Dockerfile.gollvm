@@ -32,14 +32,17 @@ RUN apt update && apt install -y ninja-build &&\
 
 ENV LD_LIBRARY_PATH=/build-debug/tools/gollvm/libgo
 
+ADD scripts/build/gollvm.patch /tmp/
 RUN cd /llvm-project && git checkout 96b0b9a5e &&\
     cd llvm/tools/gollvm && git checkout d30fc0bf &&\
     cd gofrontend && git checkout ae20684902 &&\
+    git apply /tmp/gollvm.patch &&\
     cd ../libgo/libffi && git checkout 8111cd0692 &&\
     cd ../libbacktrace && git checkout f24e9f4
 
 RUN mkdir /build-debug &&\
     cd /build-debug &&\
-    cmake -DCMAKE_BUILD_TYPE=Debug -DLLVM_USE_LINKER=gold -G Ninja ../llvm-project/llvm &&\
+    cmake -DLLVM_TARGETS_TO_BUILD=X86 -DCMAKE_BUILD_TYPE=RelWithDebInfo -DLLVM_USE_LINKER=gold -G Ninja ../llvm-project/llvm &&\
     ninja gollvm &&\
-    ninja install-gollvm -v
+    ninja install-gollvm &&\
+    ninja llvm-link

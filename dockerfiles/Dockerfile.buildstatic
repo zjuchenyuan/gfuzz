@@ -1,39 +1,37 @@
 FROM zjuchenyuan/gollvm
 
-ENV COMMIT release-20210125.0
-
-RUN git clone https://github.com/google/gvisor /gvisor &&\
-    cd /gvisor &&\
-    git checkout $COMMIT &&\
+ADD scripts/build /g/scripts/build
+ADD scripts/ir2cfg /g/scripts/ir2cfg
+RUN COMMENT="install bazel" && cd / &&\
     curl -fsSL https://bazel.build/bazel-release.pub.gpg | gpg --dearmor > bazel.gpg &&\
     mv bazel.gpg /etc/apt/trusted.gpg.d/ &&\
     echo "deb [arch=amd64] https://storage.googleapis.com/bazel-apt stable jdk1.8" > /etc/apt/sources.list.d/bazel.list &&\
     apt update && apt install -y bazel-3.7.0 &&\
-    ln -s /usr/bin/bazel-3.7.0 /usr/bin/bazel
-
-ADD scripts/build/buildrunsc.sh /g/scripts/build/
-ADD scripts/build/packtmpr.py /g/scripts/build/
-ADD scripts/build/rewritebuilder.py /g/scripts/build/
-
-RUN ln -s /usr/bin/python3 /usr/bin/python &&\
+    ln -s /usr/bin/bazel-3.7.0 /usr/bin/bazel &&\
+    COMMENT="install go 1.15.3" && cd / &&\
+    ln -s /usr/bin/python3 /usr/bin/python &&\
     apt install -y zip unzip &&\
-    cd /gvisor && /g/scripts/build/buildrunsc.sh $COMMIT
-
-ADD scripts/build/gocallvis_edgeprint.patch /g/scripts/build/
-ADD scripts/build/gocallvis_rta.patch /g/scripts/build/
-
-RUN wget -q https://golang.org/dl/go1.15.3.linux-amd64.tar.gz &&\
+    wget -q https://golang.org/dl/go1.15.3.linux-amd64.tar.gz &&\
     tar xf go1.15.3.linux-amd64.tar.gz &&\
+    COMMENT="install go-callvis to /g"&& cd / &&\
     git clone https://github.com/ofabry/go-callvis &&\
     cd go-callvis && git checkout 71bdc75 &&\
     git apply /g/scripts/build/gocallvis_edgeprint.patch &&\
     /go/bin/go build && mv go-callvis /g/go-callvis &&\
     git apply /g/scripts/build/gocallvis_rta.patch &&\
-    /go/bin/go build && mv go-callvis /g/go-callvis.rta
-ADD scripts/build/coverage.go /g/scripts/build/
-ADD scripts/build/r2gopath.py /g/scripts/build/
-ADD scripts/build/buildgopath.sh /g/scripts/build/
-RUN cd /gvisor && PATH=/go/bin:$PATH /g/scripts/build/buildgopath.sh $COMMIT
-ADD scripts/build/buildllvmir.sh /g/scripts/build/
-ADD scripts/build/buildlog_rewrite.py /g/scripts/build/
-RUN /g/scripts/build/buildllvmir.sh $COMMIT
+    /go/bin/go build && mv go-callvis /g/go-callvis.rta &&\
+    COMMENT="fetch llvm source code and compile our ir2cfg" && cd / &&\
+    wget -q https://github.com/llvm/llvm-project/releases/download/llvmorg-10.0.1/llvm-project-10.0.1.tar.xz &&\
+    tar xf llvm-project-10.0.1.tar.xz && rm llvm-project-10.0.1.tar.xz &&\
+    cd /g/scripts/ir2cfg &&\
+    cmake -DCYY_LLVM_SRC_DIR=/llvm-project-10.0.1 . && make &&\
+    COMMENT="prepare gvisor" && cd / &&\
+    git clone https://github.com/google/gvisor /gvisor
+
+ENV COMMIT release-20210125.0
+RUN cd /gvisor && git checkout $COMMIT &&\
+    /g/scripts/build/buildrunsc.sh $COMMIT &&\
+    PATH=/go/bin:$PATH /g/scripts/build/buildgopath.sh $COMMIT &&\
+    rm -rf /root/.cache/go-build &&\
+    /g/scripts/build/buildllvmir.sh $COMMIT &&\
+    /g/scripts/build/getcfg.sh $COMMIT

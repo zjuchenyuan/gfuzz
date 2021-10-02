@@ -1,0 +1,114 @@
+From d31e1b83806cfe7bd51ebaac01d21884695b41d6 Mon Sep 17 00:00:00 2001
+From: zjuchenyuan <chenyuan.gfuzz@qiushi.ac.cn>
+Date: Thu, 3 Dec 2020 12:32:32 +0000
+Subject: [PATCH 1/2] try fix Iovec_len_t, Msghdr_controllen_t, TIOCGPTN and
+ TIOCSPTLCK issues in syscall package
+
+---
+ libgo/go/syscall/socket.go |  4 ++--
+ libgo/mksysinfo.sh         | 24 ++++++++++++------------
+ 2 files changed, 14 insertions(+), 14 deletions(-)
+
+diff --git a/libgo/go/syscall/socket.go b/libgo/go/syscall/socket.go
+index f42679d2..30342366 100644
+--- a/libgo/go/syscall/socket.go
++++ b/libgo/go/syscall/socket.go
+@@ -435,11 +435,11 @@ func SendmsgN(fd int, p, oob []byte, to Sockaddr, flags int) (n int, err error)
+ //shutdown(fd _C_int, how _C_int) _C_int
+
+ func (iov *Iovec) SetLen(length int) {
+-       iov.Len = Iovec_len_t(length)
++       iov.Len = uint64(length)
+ }
+
+ func (msghdr *Msghdr) SetControllen(length int) {
+-       msghdr.Controllen = Msghdr_controllen_t(length)
++       msghdr.Controllen = uint64(length)
+ }
+
+ func (cmsg *Cmsghdr) SetLen(length int) {
+diff --git a/libgo/mksysinfo.sh b/libgo/mksysinfo.sh
+index deac5ce8..bea5ec35 100755
+--- a/libgo/mksysinfo.sh
++++ b/libgo/mksysinfo.sh
+@@ -617,7 +617,7 @@ echo "type Iovec_len_t $iovec_len" >> ${OUT}
+ echo $iovec | \
+     sed -e 's/_iovec/Iovec/' \
+       -e 's/iov_base/Base/' \
+-      -e 's/iov_len *[a-zA-Z0-9_]*/Len Iovec_len_t/' \
++      -e 's/iov_len *[a-zA-Z0-9_]*/Len uint64/' \
+     >> ${OUT}
+
+ # The msghdr struct.
+@@ -632,7 +632,7 @@ echo $msghdr | \
+       -e 's/msg_iovlen/Iovlen/' \
+       -e 's/_iovec/Iovec/' \
+       -e 's/msg_control/Control/' \
+-      -e 's/msg_controllen *[a-zA-Z0-9_]*/Controllen Msghdr_controllen_t/' \
++      -e 's/msg_controllen *[a-zA-Z0-9_]*/Controllen uint64/' \
+       -e 's/msg_flags/Flags/' \
+     >> ${OUT}
+
+@@ -806,16 +806,16 @@ if ! grep '^const TIOCSPGRP' ${OUT} >/dev/null 2>&1; then
+     echo 'const TIOCSPGRP = _TIOCSPGRP_val' >> ${OUT}
+   fi
+ fi
+-if ! grep '^const TIOCGPTN' ${OUT} >/dev/null 2>&1; then
+-  if grep '^const _TIOCGPTN_val' ${OUT} >/dev/null 2>&1; then
+-    echo 'const TIOCGPTN = _TIOCGPTN_val' >> ${OUT}
+-  fi
+-fi
+-if ! grep '^const TIOCSPTLCK' ${OUT} >/dev/null 2>&1; then
+-  if grep '^const _TIOCSPTLCK_val' ${OUT} >/dev/null 2>&1; then
+-    echo 'const TIOCSPTLCK = _TIOCSPTLCK_val' >> ${OUT}
+-  fi
+-fi
++#if ! grep '^const TIOCGPTN' ${OUT} >/dev/null 2>&1; then
++#  if grep '^const _TIOCGPTN_val' ${OUT} >/dev/null 2>&1; then
++    echo 'const TIOCGPTN = 2147767344' >> ${OUT}
++#  fi
++#fi
++#if ! grep '^const TIOCSPTLCK' ${OUT} >/dev/null 2>&1; then
++#  if grep '^const _TIOCSPTLCK_val' ${OUT} >/dev/null 2>&1; then
++    echo 'const TIOCSPTLCK = 1074025521' >> ${OUT}
++#  fi
++#fi
+ if ! grep '^const TIOCGDEV' ${OUT} >/dev/null 2>&1; then
+   if grep '^const _TIOCGDEV_val' ${OUT} >/dev/null 2>&1; then
+     echo 'const TIOCGDEV = _TIOCGDEV_val' >> ${OUT}
+--
+2.17.1
+
+
+From c0aad379f85efc779ffe7a24b8f27c4141c83694 Mon Sep 17 00:00:00 2001
+From: zjuchenyuan <chenyuan.gfuzz@qiushi.ac.cn>
+Date: Thu, 3 Dec 2020 13:08:26 +0000
+Subject: [PATCH 2/2] fix const TUNSETIFF = 1074025674
+
+---
+ libgo/mksysinfo.sh | 10 +++++-----
+ 1 file changed, 5 insertions(+), 5 deletions(-)
+
+diff --git a/libgo/mksysinfo.sh b/libgo/mksysinfo.sh
+index bea5ec35..5210004a 100755
+--- a/libgo/mksysinfo.sh
++++ b/libgo/mksysinfo.sh
+@@ -839,11 +839,11 @@ if ! grep '^const TUNSETDEBUG' ${OUT} >/dev/null 2>&1; then
+   fi
+ fi
+
+-if ! grep '^const TUNSETIFF' ${OUT} >/dev/null 2>&1; then
+-  if grep '^const _TUNSETIFF_val' ${OUT} >/dev/null 2>&1; then
+-    echo 'const TUNSETIFF = _TUNSETIFF_val' >> ${OUT}
+-  fi
+-fi
++#if ! grep '^const TUNSETIFF' ${OUT} >/dev/null 2>&1; then
++#  if grep '^const _TUNSETIFF_val' ${OUT} >/dev/null 2>&1; then
++    echo 'const TUNSETIFF = 1074025674' >> ${OUT}
++#  fi
++#fi
+
+ if ! grep '^const TUNSETPERSIST' ${OUT} >/dev/null 2>&1; then
+   if grep '^const _TUNSETPERSIST_val' ${OUT} >/dev/null 2>&1; then
+--
+2.17.1
