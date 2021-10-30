@@ -1,0 +1,3553 @@
+From 7ffac3dd61f054361a5bd2d1ab0274a3f8131d65 Mon Sep 17 00:00:00 2001
+From: zjuchenyuan <chenyuan.gfuzz@qiushi.ac.cn>
+Date: Sat, 30 Jan 2021 22:16:50 +0800
+Subject: [PATCH] [gfuzz] gfuzz changes
+
+---
+ Makefile                       |   4 +-
+ executor/cov_filter.h          |   5 +-
+ gfuzz/gfuzz.go                 |  58 ++++
+ pkg/compiler/compiler.go       | 162 ++++++++-
+ pkg/compiler/consts.go         | 136 ++++++++
+ pkg/cover/backend/gvisor.go    |   2 +-
+ pkg/cover/cover.go             |  12 +-
+ pkg/csource/csource_test.go    |   2 +-
+ pkg/ipc/ipc.go                 |   5 +
+ pkg/mgrconfig/config.go        |  72 ++++
+ pkg/mgrconfig/load.go          |  29 ++
+ pkg/repro/repro.go             |   2 +-
+ pkg/rpctype/rpctype.go         |  53 ++-
+ pkg/signal/signal.go           |  25 +-
+ prog/clone.go                  |   1 +
+ prog/encoding_test.go          |   2 +-
+ prog/generation.go             |  51 +++
+ prog/minimization.go           |   9 +-
+ prog/minimization_test.go      |   6 +-
+ prog/mutation.go               |  94 +++++-
+ prog/prog.go                   |   1 +
+ prog/prog_test.go              |   2 +-
+ prog/rand.go                   |  24 +-
+ prog/rand_test.go              |   2 +-
+ prog/types.go                  |   1 +
+ sys/linux/vnet.txt             |  48 +++
+ sys/targets/targets.go         |   5 +-
+ syz-fuzzer/fuzzer.go           | 589 ++++++++++++++++++++++++++++++++-
+ syz-fuzzer/fuzzer_test.go      |   8 +-
+ syz-fuzzer/proc.go             | 488 +++++++++++++++++++++++++--
+ syz-fuzzer/workqueue.go        |  68 +++-
+ syz-manager/covfilter.go       |  10 +-
+ syz-manager/html.go            |  27 ++
+ syz-manager/manager.go         |  69 +++-
+ syz-manager/rpc.go             | 120 ++++++-
+ tools/syz-db/syz-db.go         |  10 +
+ tools/syz-execprog/execprog.go |   3 +-
+ tools/syz-mutate/mutate.go     |   2 +-
+ tools/syz-showprio/genprog.go  |  42 +++
+ tools/syz-stress/stress.go     |   6 +-
+ vm/gvisor/gvisor.go            |  54 ++-
+ 41 files changed, 2163 insertions(+), 146 deletions(-)
+ create mode 100644 gfuzz/gfuzz.go
+ create mode 100644 tools/syz-showprio/genprog.go
+
+diff --git a/Makefile b/Makefile
+index 69049d6b2..0cf86a6a5 100644
+--- a/Makefile
++++ b/Makefile
+@@ -146,7 +146,7 @@ descriptions:
+ manager: descriptions
+ 	GOOS=$(HOSTOS) GOARCH=$(HOSTARCH) $(HOSTGO) build $(GOHOSTFLAGS) -o ./bin/syz-manager github.com/google/syzkaller/syz-manager
+ 
+-runtest: descriptions
++runtest: descriptions manager
+ 	GOOS=$(HOSTOS) GOARCH=$(HOSTARCH) $(HOSTGO) build $(GOHOSTFLAGS) -o ./bin/syz-runtest github.com/google/syzkaller/tools/syz-runtest
+ 
+ fuzzer: descriptions
+@@ -161,7 +161,7 @@ ci: descriptions
+ hub: descriptions
+ 	GOOS=$(HOSTOS) GOARCH=$(HOSTARCH) $(HOSTGO) build $(GOHOSTFLAGS) -o ./bin/syz-hub github.com/google/syzkaller/syz-hub
+ 
+-repro: descriptions
++repro: descriptions manager
+ 	GOOS=$(HOSTOS) GOARCH=$(HOSTARCH) $(HOSTGO) build $(GOHOSTFLAGS) -o ./bin/syz-repro github.com/google/syzkaller/tools/syz-repro
+ 
+ mutate: descriptions
+diff --git a/executor/cov_filter.h b/executor/cov_filter.h
+index a8b6624fe..b80815584 100644
+--- a/executor/cov_filter.h
++++ b/executor/cov_filter.h
+@@ -31,7 +31,8 @@ static void init_coverage_filter()
+ 	cov_filter = (cov_filter_t*)mmap(preferred, st.st_size, PROT_READ, MAP_PRIVATE, f, 0);
+ 	if (cov_filter != preferred)
+ 		failmsg("failed to mmap coverage filter bitmap", "want=%p, got=%p", preferred, cov_filter);
+-	if ((uint32)st.st_size != sizeof(uint32) * 2 + ((cov_filter->pcsize >> 4) + 7) / 8)
++	//	if ((uint32)st.st_size != sizeof(uint32) * 2 + ((cov_filter->pcsize >> 4) + 7) / 8)
++	if ((uint32)st.st_size != sizeof(uint32) * 2 + ((cov_filter->pcsize) + 7) / 8)
+ 		fail("bad coverage filter bitmap size");
+ 	close(f);
+ }
+@@ -48,7 +49,7 @@ static bool coverage_filter(uint64 pc)
+ 		return false;
+ 	// For minimizing the size of bitmap, the lowest 4-bit will be dropped.
+ 	pc32 -= cov_filter->pcstart;
+-	pc32 = pc32 >> 4;
++	//	pc32 = pc32 >> 4;
+ 	uint32 idx = pc32 / 8;
+ 	uint32 shift = pc32 % 8;
+ 	return (cov_filter->bitmap[idx] & (1 << shift)) > 0;
+diff --git a/gfuzz/gfuzz.go b/gfuzz/gfuzz.go
+new file mode 100644
+index 000000000..b99542ec3
+--- /dev/null
++++ b/gfuzz/gfuzz.go
+@@ -0,0 +1,58 @@
++package gfuzz
++
++import (
++	"fmt"
++	"github.com/google/syzkaller/pkg/log"
++	"os"
++	"time"
++)
++
++var fGFUZZlog *os.File
++var Status string = ""
++
++func initGFUZZlog() {
++	var err error
++	fGFUZZlog, err = os.OpenFile(fmt.Sprintf("/workdir/gfuzz_%v.log", os.Getenv("INDEX")), os.O_APPEND|os.O_WRONLY|os.O_CREATE, 0644)
++	if err != nil {
++		log.Fatalf("cannot write gfuzz log: %v", err)
++		return
++	}
++}
++
++var oldline string
++var oldline_cnt int
++var NoLog bool
++
++func GFUZZlog(format string, a ...interface{}) {
++	if NoLog {
++		return
++	}
++	if fGFUZZlog == nil {
++		initGFUZZlog()
++	}
++	log.Logf(0, format, a...)
++	outstr := fmt.Sprintf(format, a...)
++	if outstr == oldline {
++		oldline_cnt += 1
++		return
++	}
++	if oldline_cnt > 0 {
++		fmt.Fprintf(fGFUZZlog, "%s_repeat=%v %s\n", time.Now().Format("2006/01/02 15:04:05"), oldline_cnt, oldline)
++	}
++	oldline = outstr
++	oldline_cnt = 0
++	_, err := fmt.Fprintf(fGFUZZlog, "%s %s\n", time.Now().Format("2006/01/02 15:04:05"), outstr)
++	if err != nil {
++		log.Logf(0, "cannot write gfuzz log: %v", err)
++		return
++	}
++}
++
++type RuleInferredSyscalls struct {
++	Name  string        `json:"name"`
++	Id    int           `json:"-"`
++	Rules map[string]uint `json:"rules"`
++}
++
++var RuleCalls []RuleInferredSyscalls
++var UseRuleCall map[string]uint
+\ No newline at end of file
+diff --git a/pkg/compiler/compiler.go b/pkg/compiler/compiler.go
+index a361b3928..59dad720f 100644
+--- a/pkg/compiler/compiler.go
++++ b/pkg/compiler/compiler.go
+@@ -10,6 +10,8 @@ import (
+ 	"sort"
+ 	"strconv"
+ 	"strings"
++	"encoding/json"
++	//"reflect"
+ 
+ 	"github.com/google/syzkaller/pkg/ast"
+ 	"github.com/google/syzkaller/prog"
+@@ -43,6 +45,25 @@ type Prog struct {
+ 	fileConsts map[string]*ConstInfo
+ }
+ 
++var Desc2Name = map[*typeDesc]string {
++	typeInt: "int",
++	typePtr: "ptr",
++	typeVoid: "void",
++	typeArray: "array",
++	typeLen: "len",
++	typeConst: "const",
++	typeFlags: "flags",
++	typeVMA: "vma",
++	typeCsum: "csum",
++	typeProc: "proc",
++	typeText: "text",
++	typeString: "string",
++	typeFmt: "fmt",
++	typeResource: "resource",
++	typeStruct: "struct",
++	typeTypedef: "typedef",
++}
++
+ func createCompiler(desc *ast.Description, target *targets.Target, eh ast.ErrorHandler) *compiler {
+ 	if eh == nil {
+ 		eh = ast.LoggingHandler
+@@ -66,6 +87,8 @@ func createCompiler(desc *ast.Description, target *targets.Target, eh ast.ErrorH
+ 		builtinConsts: map[string]uint64{
+ 			"PTR_SIZE": target.PtrSize,
+ 		},
++		CurNode: nil,
++		Node2Consts: make(map[string][]string),
+ 	}
+ 	return comp
+ }
+@@ -113,6 +136,140 @@ func Compile(desc *ast.Description, consts map[string]uint64, target *targets.Ta
+ 	return prg
+ }
+ 
++func (comp *compiler) collectUsedType2(call *ast.Call, path *[]*ast.Type, t *ast.Type, isArg bool) {
++	for _, i := range *path{
++		if i==t{
++			return // skip circle
++		}
++	}
++	desc := comp.getTypeDesc(t)
++	tt := t
++	if desc == typeFlags {
++		tt = t.Args[0]
++	}
++	
++	typename := Desc2Name[desc]
++	if typename == "struct" && comp.structs[t.Ident].IsUnion{
++	    typename = "union"
++	    
++	    names := make([]string, 0)
++	    for _,i:=range comp.structs[t.Ident].Fields{
++	    	n := i.Type.Ident
++	    	if n == "array" {
++	    	    n = i.Type.Args[0].Ident
++	    	}
++	        names = append(names, n)
++	    }
++	    names_str, _ := json.Marshal(names)
++	    fmt.Printf("UNION\t%v\t%v\n", t.Ident, string(names_str))
++	}
++	
++	if len(*path)>0 && (typename=="flags" || typename=="resource" || typename=="struct" || typename=="union") {
++		idx := len(*path)-1
++		prev := (*path)[idx]
++		for prev.Ident == "array" || prev.Ident == "ptr" || prev.Ident == "ptr64" {
++			idx -= 1
++			if idx<0{
++				break
++			}
++			prev = (*path)[idx]
++		}
++		
++		if idx<0{
++			fmt.Printf("CALL\t%v\t%v\t%v\t%v\n", call.Name.Name, typename, tt.Ident, comp.Node2Consts[tt.Ident])
++		} else {
++			fmt.Printf("EDGE\t%v\t%v\t%v\t%v\n", prev.Ident, typename, tt.Ident, comp.Node2Consts[tt.Ident])
++		}
++	}
++	*path = append(*path, t)
++	defer func(){*path = (*path)[:len(*path)-1]}()
++	if desc == typeResource {
++		r := comp.resources[t.Ident]
++		for r != nil {
++			r = comp.resources[r.Base.Ident]
++		}
++		return
++	}
++	if desc == typeStruct {
++		s := comp.structs[t.Ident]
++		for _, fld := range s.Fields {
++			comp.collectUsedType2(call, path, fld.Type, false)
++		}
++		return
++	}
++	if desc == typeFlags {
++		//fmt.Printf("FLAG\t%v\t\t%v\n", t.Args[0].Ident, comp.Node2Consts[t.Args[0].Ident])
++		return
++	}
++	if desc == typeString {
++		return
++	}
++	_, args, _ := comp.getArgsBase(t, isArg)
++	for i, arg := range args {
++		if desc.Args[i].Type == typeArgType {
++			comp.collectUsedType2(call, path, arg, desc.Args[i].IsArg)
++		}
++	}
++}
++
++// Compile2 compiles sys description.
++func Compile2(desc *ast.Description, consts map[string]uint64, target *targets.Target, eh ast.ErrorHandler) *Prog {
++	comp := createCompiler(desc.Clone(), target, eh)
++	comp.typecheck()
++	// The subsequent, more complex, checks expect basic validity of the tree,
++	// in particular corrent number of type arguments. If there were errors,
++	// don't proceed to avoid out-of-bounds references to type arguments.
++	if comp.errors != 0 {
++		return nil
++	}
++	if consts == nil {
++		fileConsts := comp.extractConsts()
++		if comp.errors != 0 {
++			return nil
++		}
++		return &Prog{fileConsts: fileConsts}
++	}
++	if comp.target.SyscallNumbers {
++		comp.assignSyscallNumbers(consts)
++	}
++	comp.patchConsts2(consts)
++
++	for _, decl := range comp.desc.Nodes {
++		switch n := decl.(type) {
++		case *ast.Call:
++			path := make([]*ast.Type, 0)
++			for _, arg := range n.Args {
++				comp.collectUsedType2(n, &path, arg.Type, true)
++			}
++			if n.Ret != nil {
++				comp.collectUsedType2(n, &path, n.Ret, true)
++			}
++			//fmt.Printf("call %v %v\n", n.Name.Name, path)
++		}
++	}
++
++	comp.check()
++	if comp.errors != 0 {
++		return nil
++	}
++	syscalls := comp.genSyscalls()
++	comp.layoutTypes(syscalls)
++	types := comp.generateTypes(syscalls)
++	prg := &Prog{
++		Resources:   comp.genResources(),
++		Syscalls:    syscalls,
++		Types:       types,
++		Unsupported: comp.unsupported,
++	}
++	if comp.errors != 0 {
++		return nil
++	}
++	for _, w := range comp.warnings {
++		eh(w.pos, w.msg)
++	}
++	return prg
++}
++
+ type compiler struct {
+ 	desc     *ast.Description
+ 	target   *targets.Target
+@@ -133,6 +290,8 @@ type compiler struct {
+ 	structVarlen  map[string]bool
+ 	structTypes   map[string]prog.Type
+ 	builtinConsts map[string]uint64
++	CurNode       *ast.Node
++	Node2Consts   map[string][]string
+ }
+ 
+ type warn struct {
+@@ -267,9 +426,9 @@ func (comp *compiler) derefPointers(t *ast.Type) (*ast.Type, *typeDesc) {
+ 		t = t.Args[1]
+ 	}
+ }
+-
+ func (comp *compiler) foreachType(n0 ast.Node,
+ 	cb func(*ast.Type, *typeDesc, []*ast.Type, prog.IntTypeCommon)) {
++	comp.CurNode = &n0
+ 	switch n := n0.(type) {
+ 	case *ast.Call:
+ 		for _, arg := range n.Args {
+@@ -291,6 +450,7 @@ func (comp *compiler) foreachType(n0 ast.Node,
+ 	default:
+ 		panic(fmt.Sprintf("unexpected node %#v", n0))
+ 	}
++	comp.CurNode = nil
+ }
+ 
+ func (comp *compiler) foreachSubType(t *ast.Type, isArg bool,
+diff --git a/pkg/compiler/consts.go b/pkg/compiler/consts.go
+index 3e8773a03..9ba9fb28f 100644
+--- a/pkg/compiler/consts.go
++++ b/pkg/compiler/consts.go
+@@ -6,6 +6,8 @@ package compiler
+ import (
+ 	"fmt"
+ 	"strings"
++	"encoding/json"
++//	"runtime/debug"
+ 
+ 	"github.com/google/syzkaller/pkg/ast"
+ 	"github.com/google/syzkaller/prog"
+@@ -269,6 +271,7 @@ func (comp *compiler) patchTypeConst(n *ast.Type, consts map[string]uint64, miss
+ 	}
+ }
+ 
++
+ func (comp *compiler) patchConst(val *uint64, id *string, consts map[string]uint64, missing *string, reset bool) bool {
+ 	if *id == "" {
+ 		return true
+@@ -288,3 +291,136 @@ func (comp *compiler) patchConst(val *uint64, id *string, consts map[string]uint
+ 	*val = 1
+ 	return false
+ }
++
++func (comp *compiler) patchIntConst2(n *ast.Int, consts map[string]uint64, missing *string) bool {
++	return comp.patchConst2(&n.Value, &n.Ident, consts, missing, false)
++}
++
++func (comp *compiler) patchTypeConst2(n *ast.Type, consts map[string]uint64, missing *string) {
++	comp.patchConst2(&n.Value, &n.Ident, consts, missing, true)
++	for _, col := range n.Colon {
++		comp.patchConst2(&col.Value, &col.Ident, consts, missing, true)
++	}
++}
++
++func (comp *compiler) patchConst2(val *uint64, id *string, consts map[string]uint64, missing *string, reset bool) bool {
++	if *id == "" {
++		return true
++	}
++	if v, ok := consts[*id]; ok {
++	
++	//GFUZZ add
++	//if(*id=="NDISC_ROUTER_ADVERTISEMENT"){
++		_,typ,curname:=(*comp.CurNode).Info()
++		if comp.Node2Consts[curname]==nil{
++			comp.Node2Consts[curname] = make([]string, 0)
++		}
++		comp.Node2Consts[curname] = append(comp.Node2Consts[curname], *id)
++		if typ=="syscall"{
++			fmt.Printf("CALLCONST\t%v\t%v\t%v\t%v\n", curname, "", "", *id)
++		}
++		//fmt.Printf("patchConst %v %v %v %v %v\n", *id, consts[*id], pos,typ,name)//.(*ast.Struct).Name
++		//debug.PrintStack()
++	//}
++	//GFUZZ add end
++		if reset {
++			//*id = ""
++		}
++		*val = v
++		return true
++	}
++	if missing != nil && *missing == "" {
++		*missing = *id
++	}
++	// 1 is slightly safer than 0 and allows to work-around e.g. an array size
++	// that comes from a const missing on an arch. Also see the TODO in patchConsts.
++	*val = 1
++	return false
++}
++
++// patchConsts2 replaces all symbolic consts with their numeric values taken from consts map.
++// Updates desc and returns set of unsupported syscalls and flags.
++func (comp *compiler) patchConsts2(consts0 map[string]uint64) {
++	//fmt.Printf("patchConsts2 %v\n", consts0)
++	consts := make(map[string]uint64)
++	for name, val := range consts0 {
++		consts[name] = val
++	}
++	for name, val := range comp.builtinConsts {
++		if _, ok := consts[name]; ok {
++			panic(fmt.Sprintf("builtin const %v already defined", name))
++		}
++		consts[name] = val
++	}
++	//fmt.Printf("len(comp.desc.Nodes)=%v\n", len(comp.desc.Nodes))
++	for _, decl := range comp.desc.Nodes {
++		comp.CurNode = &decl
++		switch n := decl.(type) {
++		case *ast.IntFlags:
++			// Unsupported flag values are dropped.
++			names := make([]string, 0)
++			for _, v := range n.Values {
++				names = append(names, v.Ident)
++			}
++			names_str, _ := json.Marshal(names)
++			fmt.Printf("FLAGS\t%v\t%s\n", n.Name.Name, names_str)
++			var values []*ast.Int
++			for _, v := range n.Values {
++				if comp.patchIntConst2(v, consts, nil) {
++					values = append(values, v)
++				}
++			}
++			n.Values = values
++		case *ast.Resource, *ast.Struct, *ast.Call, *ast.TypeDef:
++			// Walk whole tree and replace consts in Type's and Int's.
++			missing := ""
++			comp.foreachType(decl, func(_ *ast.Type, desc *typeDesc,
++				args []*ast.Type, _ prog.IntTypeCommon) {
++				for i, arg := range args {
++					if desc.Args[i].Type.Kind == kindInt {
++						comp.patchTypeConst2(arg, consts, &missing)
++					}
++				}
++			})
++			comp.CurNode = &n
++			switch n := decl.(type) {
++			case *ast.Resource:
++				for _, v := range n.Values {
++					comp.patchIntConst2(v, consts, &missing)
++				}
++			case *ast.Call:
++				for _, attr := range n.Attrs {
++					if callAttrs[attr.Ident].HasArg {
++						comp.patchTypeConst(attr.Args[0], consts, &missing)
++					}
++				}
++			case *ast.Struct:
++				for _, attr := range n.Attrs {
++					if structOrUnionAttrs(n)[attr.Ident].HasArg {
++						comp.patchTypeConst2(attr.Args[0], consts, &missing)
++					}
++				}
++			}
++			if missing == "" {
++				continue
++			}
++			// Produce a warning about unsupported syscall/resource/struct.
++			// TODO(dvyukov): we should transitively remove everything that
++			// depends on unsupported things. Potentially we still can get,
++			// say, a bad int range error due to the wrong const value.
++			// However, if we have a union where one of the options is
++			// arch-specific and does not have a const value, it's probably
++			// better to remove just that option. But then if we get to 0
++			// options in the union, we still need to remove it entirely.
++			pos, typ, name := decl.Info()
++			if id := typ + " " + name; !comp.unsupported[id] {
++				comp.unsupported[id] = true
++				comp.warning(pos, "unsupported %v: %v due to missing const %v",
++					typ, name, missing)
++			}
++			if c, ok := decl.(*ast.Call); ok {
++				c.NR = ^uint64(0) // mark as unused to not generate it
++			}
++		}
++	}
++}
+\ No newline at end of file
+diff --git a/pkg/cover/backend/gvisor.go b/pkg/cover/backend/gvisor.go
+index e82a55276..b3f56c0e0 100644
+--- a/pkg/cover/backend/gvisor.go
++++ b/pkg/cover/backend/gvisor.go
+@@ -123,4 +123,4 @@ func gvisorParseLine(s *bufio.Scanner) (Frame, error) {
+ 	return frame, nil
+ }
+ 
+-var gvisorLineRe = regexp.MustCompile(`/gvisor/([^:]+):([0-9]+).([0-9]+),([0-9]+).([0-9]+)$`)
++var gvisorLineRe = regexp.MustCompile(`([^:]+):([0-9]+).([0-9]+),([0-9]+).([0-9]+)$`)
+diff --git a/pkg/cover/cover.go b/pkg/cover/cover.go
+index 572d5e5da..6cdb78670 100644
+--- a/pkg/cover/cover.go
++++ b/pkg/cover/cover.go
+@@ -4,7 +4,10 @@
+ // Package cover provides types for working with coverage information (arrays of covered PCs).
+ package cover
+ 
+-type Cover map[uint32]struct{}
++import "time"
++
++//type Cover map[uint32]struct{}
++type Cover map[uint32]int64
+ 
+ type Subsystem struct {
+ 	Name  string   `json:"name"`
+@@ -18,7 +21,10 @@ func (cov *Cover) Merge(raw []uint32) {
+ 		*cov = c
+ 	}
+ 	for _, pc := range raw {
+-		c[pc] = struct{}{}
++		if _, ok := c[pc]; ok {
++			continue
++		}
++		c[pc] = time.Now().Unix()
+ 	}
+ }
+ 
+@@ -34,7 +40,7 @@ func (cov *Cover) MergeDiff(raw []uint32) []uint32 {
+ 		if _, ok := c[pc]; ok {
+ 			continue
+ 		}
+-		c[pc] = struct{}{}
++		c[pc] = time.Now().Unix()
+ 		raw[n] = pc
+ 		n++
+ 	}
+diff --git a/pkg/csource/csource_test.go b/pkg/csource/csource_test.go
+index b7b2df486..5a297e561 100644
+--- a/pkg/csource/csource_test.go
++++ b/pkg/csource/csource_test.go
+@@ -66,7 +66,7 @@ func testTarget(t *testing.T, target *prog.Target, full bool) {
+ 	} else {
+ 		minimized, _ := prog.Minimize(syzProg, -1, false, func(p *prog.Prog, call int) bool {
+ 			return len(p.Calls) == len(syzProg.Calls)
+-		})
++		}, 0)
+ 		p.Calls = append(p.Calls, minimized.Calls...)
+ 		opts = allOptionsPermutations(target.OS)
+ 	}
+diff --git a/pkg/ipc/ipc.go b/pkg/ipc/ipc.go
+index 643f16582..e43375aab 100644
+--- a/pkg/ipc/ipc.go
++++ b/pkg/ipc/ipc.go
+@@ -55,6 +55,9 @@ const (
+ 	FlagThreaded                                   // use multiple threads to mitigate blocked syscalls
+ 	FlagCollide                                    // collide syscalls to provoke data races
+ 	FlagEnableCoverageFilter                       // setup and use bitmap to do coverage filter
++	FlagEnableRandomChoose                         // use random choice instead of based on len(signal)
++	FlagEnableGlobalDistance                       // use global min distance to determine max energy
++	FlagEnableSeedExecLimit                        // limit seed exec times to 2*avgcost
+ )
+ 
+ type ExecOpts struct {
+@@ -276,6 +279,7 @@ func (env *Env) Exec(opts *ExecOpts, p *prog.Prog) (output []byte, info *ProgInf
+ 			// The executor is actually ssh,
+ 			// starting them too frequently leads to timeouts.
+ 			<-rateLimit.C
++
+ 		}
+ 		tmpDirPath := "./"
+ 		atomic.AddUint64(&env.StatRestarts, 1)
+@@ -553,6 +557,7 @@ func makeCommand(pid int, bin []string, config *Config, inFile, outFile *os.File
+ 		// and other things, so let's better wait than report false misleading crashes.
+ 		timeout *= 10
+ 	}
++	fmt.Printf("[makeCommand] pid: %v, config: %v, tempdir: %v\n", pid, config, dir)
+ 
+ 	c := &command{
+ 		pid:     pid,
+diff --git a/pkg/mgrconfig/config.go b/pkg/mgrconfig/config.go
+index e4bfc46f8..7dd872f19 100644
+--- a/pkg/mgrconfig/config.go
++++ b/pkg/mgrconfig/config.go
+@@ -150,6 +150,73 @@ type Config struct {
+ 	// Parameters for concrete types are in Config type in vm/TYPE/TYPE.go, e.g. vm/qemu/qemu.go.
+ 	VM json.RawMessage `json:"vm"`
+ 
++	//Distance per pc block file, should be a json file
++	DistanceFile string `json:"distance,omitempty"`
++
++	//CFG file tells each pc's descendant pcs
++	PCCFGFile string `json:"pccfgfile,omitempty"`
++
++	// Enable random choose seed, instead of based on length of the signal
++	EnableRandomChoose bool `json:"random_choose,omitempty"`
++
++	// Use global corpus min distance to determine max energy
++	EnableGlobalDistance bool `json:"globaldistance,omitempty"`
++
++	// Limit seed exec times to 2*avgcost
++	EnableSeedExecLimit bool `json:"limitexec,omitempty"`
++
++	// time to exploitation for cooling, default 0 to disable, this will bypass global distance
++	CoolingTx int `json:"cooling_tx,omitempty"`
++
++	// Enable smash more times (100) when seed closetDistance<10
++	EnablemoreSmash int `json:"moresmash,omitempty"`
++
++	// use closet distance instead of average distance
++	UseClosetDistance bool `json:"useclosetdistance,omitempty"`
++
++	// disable gfuzz log
++	NoLog bool `json:"nolog,omitempty"`
++
++	// if we get stuck as no new coverage during DirectchooseEntertime seconds, enter direct_choose loop, default 0 to disable direct_choose loop
++	DirectchooseEntertime int `json:"directchooseentertime,omitempty"`
++
++	// DirectchooseForceEntertime seconds passed since last direct_choose exit time, force enter direct_choose loop
++	DirectchooseForceEntertime int `json:"directchooseforceentertime,omitempty"`
++
++	DirectchooseExittime      int `json:"directchooseexittime,omitempty"`
++	DirectchooseForceExittime int `json:"directchooseforceexittime,omitempty"`
++
++	// mimic baseline, no energy calculation when enabled
++	MimicBaseline bool `json:"mimicbaseline,omitempty"`
++
++	// use progdis, this will re-execute the whole program in triage to collect coverage for the whole program, can be used for seed distance calculation
++	UseProgDis bool `json:"useprogdis,omitempty"`
++
++	//SyscallSeeds are used to generate seed prog and mutation insert
++	SyscallSeeds []string `json:"syscallseeds,omitempty"`
++
++	//Disable rotate mode
++	DisableRotate bool `json:"disable_rotate,omitempty"`
++
++	//Disable rotate choosing syscall, default will choose max 200 syscalls in rotate mode
++	DisableRotateChooseSyscall bool `json:"disable_rotatechoosesyscall,omitempty"`
++
++	//a percent (0~100) to use SyscallSeeds syscalls in mutate
++	MutateDirectChance int `json:"mutatedirectchance,omitempty"`
++
++	//target pc, this is used to write foundtime.txt
++	TargetPC []string `json:"targetpc,omitempty"`
++
++	//EnableOrderInfer enable order inference when inserting syscalls
++	EnableOrderInfer bool `json:"orderinfer,omitempty"`
++
++	//GFuzzFilter is a file of pcs which equals cover_filter, but only enabled in directed fuzzing mode
++	GFuzzFilter string `json:"gfuzzfilter,omitempty"`
++
++	//RuleCalls is a list of inferred syscalls, include name and path rules
++	// currently only inferred from const graph
++	RuleCalls []RuleInferredSyscalls `json:"rulecalls,omitempty"`
++
+ 	// Implementation details beyond this point. Filled after parsing.
+ 	Derived `json:"-"`
+ }
+@@ -159,3 +226,8 @@ type covFilterCfg struct {
+ 	Functions []string `json:"functions"`
+ 	RawPCs    []string `json:"pcs"`
+ }
++
++type RuleInferredSyscalls struct {
++	Name  string        `json:"name"`
++	Rules map[string]uint `json:"rules"`
++}
+\ No newline at end of file
+diff --git a/pkg/mgrconfig/load.go b/pkg/mgrconfig/load.go
+index abfaa30e6..1f760e225 100644
+--- a/pkg/mgrconfig/load.go
++++ b/pkg/mgrconfig/load.go
+@@ -175,6 +175,35 @@ func Complete(cfg *Config) error {
+ 		return err
+ 	}
+ 	cfg.initTimeouts()
++	if cfg.EnableGlobalDistance && cfg.CoolingTx > 0 {
++		panic("cannot enable both global distance and cooling")
++	}
++	if cfg.EnablemoreSmash > 0 {
++		if cfg.DistanceFile == "" {
++			panic("enable more_smash require distance file")
++		}
++		if cfg.EnableGlobalDistance {
++			panic("cannot enable both more_smash and global distance")
++		}
++	}
++	if cfg.DirectchooseEntertime > 0 && cfg.DirectchooseForceEntertime == 0 {
++		panic("directchooseforceentertime must be set")
++	}
++	if cfg.MimicBaseline {
++		if cfg.CoolingTx > 0 {
++			panic("cannot enable both mimicbaseline and cooling")
++		}
++		if cfg.EnableRandomChoose {
++			panic("cannot enable both mimicbaseline and random choose")
++		}
++		if cfg.EnableGlobalDistance {
++			panic("cannot enable both mimicbaseline and globaldistance")
++		}
++	}
++	if cfg.RuleCalls == nil{
++		cfg.RuleCalls = make([]RuleInferredSyscalls, 0)
++	}
++
+ 	return nil
+ }
+ 
+diff --git a/pkg/repro/repro.go b/pkg/repro/repro.go
+index 4433c84a9..3b62ea7dd 100644
+--- a/pkg/repro/repro.go
++++ b/pkg/repro/repro.go
+@@ -475,7 +475,7 @@ func (ctx *context) minimizeProg(res *Result) (*Result, error) {
+ 				return false
+ 			}
+ 			return crashed
+-		})
++		}, 0)
+ 
+ 	return res, nil
+ }
+diff --git a/pkg/rpctype/rpctype.go b/pkg/rpctype/rpctype.go
+index c87334cd5..778de1e1a 100644
+--- a/pkg/rpctype/rpctype.go
++++ b/pkg/rpctype/rpctype.go
+@@ -9,13 +9,15 @@ import (
+ 	"github.com/google/syzkaller/pkg/host"
+ 	"github.com/google/syzkaller/pkg/ipc"
+ 	"github.com/google/syzkaller/pkg/signal"
++	"time"
+ )
+ 
+ type RPCInput struct {
+-	Call   string
+-	Prog   []byte
+-	Signal signal.Serial
+-	Cover  []uint32
++	Call    string
++	Prog    []byte
++	Signal  signal.Serial
++	ProgSig signal.Serial
++	Cover   []uint32
+ }
+ 
+ type RPCCandidate struct {
+@@ -30,14 +32,36 @@ type ConnectArgs struct {
+ }
+ 
+ type ConnectRes struct {
+-	EnabledCalls       []int
+-	GitRevision        string
+-	TargetRevision     string
+-	AllSandboxes       bool
+-	CheckResult        *CheckArgs
+-	MemoryLeakFrames   []string
+-	DataRaceFrames     []string
+-	EnabledCoverFilter bool
++	EnabledCalls               []int
++	GitRevision                string
++	TargetRevision             string
++	AllSandboxes               bool
++	CheckResult                *CheckArgs
++	MemoryLeakFrames           []string
++	DataRaceFrames             []string
++	EnabledCoverFilter         bool
++	EnableRandomChoose         bool
++	EnableGlobalDistance       bool
++	EnableSeedExecLimit        bool
++	CoolingTx                  int
++	StartTime                  time.Time
++	StageStartTime             time.Time
++	LastNewSeedTime            time.Time
++	EnablemoreSmash            int
++	UseClosetDistance          bool
++	NoLog                      bool
++	DirectchooseEntertime      int
++	DirectchooseForceEntertime int
++	DirectchooseExittime       int
++	DirectchooseForceExittime  int
++	MimicBaseline              bool
++	UseProgDis                 bool
++	SyscallSeeds               []string
++	MutateDirectChance         int
++	TargetPC                   []uint32
++	EnableOrderInfer           bool
++	Mode                       string
++	RuleCallsStr               string
+ }
+ 
+ type CheckArgs struct {
+@@ -58,6 +82,11 @@ type NewInputArgs struct {
+ 	RPCInput
+ }
+ 
++type ModeChange struct {
++	Name string
++	Mode string
++}
++
+ type PollArgs struct {
+ 	Name           string
+ 	NeedCandidates bool
+diff --git a/pkg/signal/signal.go b/pkg/signal/signal.go
+index d6fa8d459..059da8b3f 100644
+--- a/pkg/signal/signal.go
++++ b/pkg/signal/signal.go
+@@ -4,16 +4,11 @@
+ // Package signal provides types for working with feedback signal.
+ package signal
+ 
+-type (
+-	elemType uint32
+-	prioType int8
+-)
+-
+-type Signal map[elemType]prioType
++type Signal map[uint32]int8
+ 
+ type Serial struct {
+-	Elems []elemType
+-	Prios []prioType
++	Elems []uint32
++	Prios []int8
+ }
+ 
+ func (s Signal) Len() int {
+@@ -57,7 +52,7 @@ func FromRaw(raw []uint32, prio uint8) Signal {
+ 	}
+ 	s := make(Signal, len(raw))
+ 	for _, e := range raw {
+-		s[elemType(e)] = prioType(prio)
++		s[uint32(e)] = int8(prio)
+ 	}
+ 	return s
+ }
+@@ -67,8 +62,8 @@ func (s Signal) Serialize() Serial {
+ 		return Serial{}
+ 	}
+ 	res := Serial{
+-		Elems: make([]elemType, len(s)),
+-		Prios: make([]prioType, len(s)),
++		Elems: make([]uint32, len(s)),
++		Prios: make([]int8, len(s)),
+ 	}
+ 	i := 0
+ 	for e, p := range s {
+@@ -113,13 +108,13 @@ func (s Signal) Diff(s1 Signal) Signal {
+ func (s Signal) DiffRaw(raw []uint32, prio uint8) Signal {
+ 	var res Signal
+ 	for _, e := range raw {
+-		if p, ok := s[elemType(e)]; ok && p >= prioType(prio) {
++		if p, ok := s[uint32(e)]; ok && p >= int8(prio) {
+ 			continue
+ 		}
+ 		if res == nil {
+ 			res = make(Signal)
+ 		}
+-		res[elemType(e)] = prioType(prio)
++		res[uint32(e)] = int8(prio)
+ 	}
+ 	return res
+ }
+@@ -160,10 +155,10 @@ type Context struct {
+ 
+ func Minimize(corpus []Context) []interface{} {
+ 	type ContextPrio struct {
+-		prio prioType
++		prio int8
+ 		idx  int
+ 	}
+-	covered := make(map[elemType]ContextPrio)
++	covered := make(map[uint32]ContextPrio)
+ 	for i, inp := range corpus {
+ 		for e, p := range inp.Signal {
+ 			if prev, ok := covered[e]; !ok || p > prev.prio {
+diff --git a/prog/clone.go b/prog/clone.go
+index c95ae206b..dbb32c758 100644
+--- a/prog/clone.go
++++ b/prog/clone.go
+@@ -25,6 +25,7 @@ func (p *Prog) Clone() *Prog {
+ 		}
+ 		p1.Calls[ci] = c1
+ 	}
++	p1.Idx = p.Idx
+ 	p1.debugValidate()
+ 	return p1
+ }
+diff --git a/prog/encoding_test.go b/prog/encoding_test.go
+index a38e9deab..708b9e12d 100644
+--- a/prog/encoding_test.go
++++ b/prog/encoding_test.go
+@@ -340,7 +340,7 @@ func TestSerializeDeserializeRandom(t *testing.T) {
+ 			p0, _ = Minimize(p0, -1, false, func(p1 *Prog, _ int) bool {
+ 				ok, _, _ := testSerializeDeserialize(t, p1, data0, data1)
+ 				return !ok
+-			})
++			}, 0)
+ 			ok, n0, n1 := testSerializeDeserialize(t, p0, data0, data1)
+ 			if ok {
+ 				t.Log("flaky?")
+diff --git a/prog/generation.go b/prog/generation.go
+index 037801b75..7ff70c154 100644
+--- a/prog/generation.go
++++ b/prog/generation.go
+@@ -4,6 +4,8 @@
+ package prog
+ 
+ import (
++	"github.com/google/syzkaller/gfuzz"
++	"github.com/google/syzkaller/pkg/hash"
+ 	"math/rand"
+ )
+ 
+@@ -31,5 +33,54 @@ func (target *Target) Generate(rs rand.Source, ncalls int, ct *ChoiceTable) *Pro
+ 	}
+ 	p.sanitizeFix()
+ 	p.debugValidate()
++	sig := hash.Hash(p.Serialize())
++	p.Idx = sig.String()
++	return p
++}
++
++// GeneratebySyscall generates a random program with ncalls calls and containing syscallIds
++// ct contains a set of allowed syscalls, if nil all syscalls are used.
++// syscallIds is a list of syscall ids, which must be included in the p
++func (target *Target) GeneratebySyscall(rs rand.Source, ncalls int, ct *ChoiceTable, syscallIds []int) *Prog {
++	p := &Prog{
++		Target: target,
++	}
++	r := newRand(target, rs)
++	s := newState(target, ct, nil)
++	idx := 0
++	for idx < len(syscallIds) {
++		var calls []*Call
++		if idx < len(syscallIds) {
++			sid := syscallIds[idx]
++			syscallid := sid
++			if sid <0 {
++				ruleid := -sid-1 // -1 -> 0, -2 -> 1
++				syscallid = gfuzz.RuleCalls[ruleid].Id
++				gfuzz.UseRuleCall = gfuzz.RuleCalls[ruleid].Rules
++			}
++			calls = r.generateParticularCall(s, r.target.Syscalls[syscallid])
++			if sid <0 {
++				gfuzz.UseRuleCall = nil
++			}
++			idx += 1
++		} else {
++			calls = r.generateCall(s, p, len(p.Calls))
++		}
++		for _, c := range calls {
++			s.analyze(c)
++			p.Calls = append(p.Calls, c)
++		}
++	}
++	// For the last generated call we could get additional calls that create
++	// resources and overflow ncalls. Remove some of these calls.
++	// The resources in the last call will be replaced with the default values,
++	// which is exactly what we want.
++	for len(p.Calls) > ncalls {
++		p.removeCall(ncalls - 1)
++	}
++	p.sanitizeFix()
++	p.debugValidate()
++	sig := hash.Hash(p.Serialize())
++	p.Idx = sig.String()
+ 	return p
+ }
+diff --git a/prog/minimization.go b/prog/minimization.go
+index 5e0383bb8..5795a8525 100644
+--- a/prog/minimization.go
++++ b/prog/minimization.go
+@@ -5,13 +5,16 @@ package prog
+ 
+ import (
+ 	"fmt"
++	"github.com/google/syzkaller/gfuzz"
++	"time"
+ )
+ 
+ // Minimize minimizes program p into an equivalent program using the equivalence
+ // predicate pred. It iteratively generates simpler programs and asks pred
+ // whether it is equal to the original program or not. If it is equivalent then
+ // the simplification attempt is committed and the process continues.
+-func Minimize(p0 *Prog, callIndex0 int, crash bool, pred0 func(*Prog, int) bool) (*Prog, int) {
++func Minimize(p0 *Prog, callIndex0 int, crash bool, pred0 func(*Prog, int) bool, allowTime float64) (*Prog, int) {
++	startTime := time.Now()
+ 	pred := func(p *Prog, callIndex int) bool {
+ 		p.sanitizeFix()
+ 		p.debugValidate()
+@@ -39,6 +42,10 @@ func Minimize(p0 *Prog, callIndex0 int, crash bool, pred0 func(*Prog, int) bool)
+ 			triedPaths: make(map[string]bool),
+ 		}
+ 	again:
++		if allowTime > 0 && time.Since(startTime).Seconds() > allowTime {
++			gfuzz.GFUZZlog("GFUZZ:minimize_timeout %v", p0.Idx)
++			break
++		}
+ 		ctx.p = p0.Clone()
+ 		ctx.call = ctx.p.Calls[i]
+ 		for j, field := range ctx.call.Meta.Args {
+diff --git a/prog/minimization_test.go b/prog/minimization_test.go
+index 36b65763d..ac6191d57 100644
+--- a/prog/minimization_test.go
++++ b/prog/minimization_test.go
+@@ -160,7 +160,7 @@ func TestMinimize(t *testing.T) {
+ 		if err != nil {
+ 			t.Fatalf("failed to deserialize original program #%v: %v", ti, err)
+ 		}
+-		p1, ci := Minimize(p, test.callIndex, false, test.pred)
++		p1, ci := Minimize(p, test.callIndex, false, test.pred, 0)
+ 		res := p1.Serialize()
+ 		if string(res) != test.result {
+ 			t.Fatalf("minimization produced wrong result #%v\norig:\n%v\nexpect:\n%v\ngot:\n%v\n",
+@@ -188,7 +188,7 @@ func TestMinimizeRandom(t *testing.T) {
+ 				}
+ 				copyP = p1.Clone()
+ 				return true
+-			})
++			}, 0)
+ 			got := string(minP.Serialize())
+ 			want := string(copyP.Serialize())
+ 			if got != want {
+@@ -207,7 +207,7 @@ func TestMinimizeCallIndex(t *testing.T) {
+ 		ci := r.Intn(len(p.Calls))
+ 		p1, ci1 := Minimize(p, ci, r.Intn(2) == 0, func(p1 *Prog, callIndex int) bool {
+ 			return r.Intn(2) == 0
+-		})
++		}, 0)
+ 		if ci1 < 0 || ci1 >= len(p1.Calls) || p.Calls[ci].Meta.Name != p1.Calls[ci1].Meta.Name {
+ 			t.Fatalf("bad call index after minimization")
+ 		}
+diff --git a/prog/mutation.go b/prog/mutation.go
+index af6a458f0..ff8552967 100644
+--- a/prog/mutation.go
++++ b/prog/mutation.go
+@@ -6,6 +6,7 @@ package prog
+ import (
+ 	"encoding/binary"
+ 	"fmt"
++	"github.com/google/syzkaller/gfuzz"
+ 	"math"
+ 	"math/rand"
+ 	"sort"
+@@ -21,7 +22,7 @@ const maxBlobLen = uint64(100 << 10)
+ // ncalls:  The allowed maximum calls in mutated program.
+ // ct:      ChoiceTable for syscalls.
+ // corpus:  The entire corpus, including original program p.
+-func (p *Prog) Mutate(rs rand.Source, ncalls int, ct *ChoiceTable, corpus []*Prog) {
++func (p *Prog) Mutate(rs rand.Source, ncalls int, ct *ChoiceTable, corpus []*Prog, directedSyscallsHead [][]int, directedSyscallsTail [][]int, chance int) {
+ 	r := newRand(p.Target, rs)
+ 	if ncalls < len(p.Calls) {
+ 		ncalls = len(p.Calls)
+@@ -33,22 +34,78 @@ func (p *Prog) Mutate(rs rand.Source, ncalls int, ct *ChoiceTable, corpus []*Pro
+ 		ct:     ct,
+ 		corpus: corpus,
+ 	}
++	shouldInsert := chance > 0 && r.Intn(100) < chance
++	if shouldInsert && len(directedSyscallsHead) > 0 {
++		allCalls := make(map[int]bool, 0)
++		for _, ids := range directedSyscallsHead {
++			for _, id := range ids {
++				allCalls[id] = true
++			}
++		}
++		needAdd := true
++		for _, call := range p.Calls {
++			if _, ok := allCalls[call.Meta.ID]; ok {
++				needAdd = false
++				break
++			}
++		}
++		if needAdd {
++			basecall_i := r.Intn(len(directedSyscallsHead))
++			if len(directedSyscallsHead[basecall_i]) > 0 {
++				chooseId := directedSyscallsHead[basecall_i][r.Intn(len(directedSyscallsHead[basecall_i]))]
++				//gfuzz.GFUZZlog("GFUZZ:Mutate insertParticularCall:%v", chooseId)
++				ctx.insertParticularCall(chooseId, false)
++			} else {
++				gfuzz.GFUZZlog("GFUZZ:Error directedSyscalls_len=0 %v %v", directedSyscallsHead, basecall_i)
++			}
++		}
++	}
+ 	for stop, ok := false, false; !stop; stop = ok && len(p.Calls) != 0 && r.oneOf(3) {
+ 		switch {
+ 		case r.oneOf(5):
++			//gfuzz.GFUZZlog("GFUZZ:Mutate squashAny %v", p.Idx)
+ 			// Not all calls have anything squashable,
+ 			// so this has lower priority in reality.
+ 			ok = ctx.squashAny()
+ 		case r.nOutOf(1, 100):
++			//gfuzz.GFUZZlog("GFUZZ:Mutate splice %v", p.Idx)
+ 			ok = ctx.splice()
+ 		case r.nOutOf(20, 31):
++			//gfuzz.GFUZZlog("GFUZZ:Mutate insertCall %v", p.Idx)
+ 			ok = ctx.insertCall()
+ 		case r.nOutOf(10, 11):
++			//gfuzz.GFUZZlog("GFUZZ:Mutate mutateArg %v", p.Idx)
+ 			ok = ctx.mutateArg()
+ 		default:
++			//gfuzz.GFUZZlog("GFUZZ:Mutate removeCall %v", p.Idx)
+ 			ok = ctx.removeCall()
+ 		}
+ 	}
++	if shouldInsert && len(directedSyscallsTail) > 0 {
++		allCalls := make(map[int]bool, 0)
++		for _, ids := range directedSyscallsTail {
++			for _, id := range ids {
++				allCalls[id] = true
++			}
++		}
++		needAdd := true
++		for _, call := range p.Calls {
++			if _, ok := allCalls[call.Meta.ID]; ok {
++				needAdd = false
++				break
++			}
++		}
++		if needAdd {
++			basecall_i := r.Intn(len(directedSyscallsTail))
++			if len(directedSyscallsTail[basecall_i]) > 0 {
++				chooseId := directedSyscallsTail[basecall_i][r.Intn(len(directedSyscallsTail[basecall_i]))]
++				//gfuzz.GFUZZlog("GFUZZ:Mutate insertParticularCall:%v", chooseId)
++				ctx.insertParticularCall(chooseId, true)
++			} else {
++				gfuzz.GFUZZlog("GFUZZ:Error directedSyscalls_len=0 %v %v", directedSyscallsTail, basecall_i)
++			}
++		}
++	}
+ 	p.sanitizeFix()
+ 	p.debugValidate()
+ 	if got := len(p.Calls); got < 1 || got > ncalls {
+@@ -146,6 +203,41 @@ func (ctx *mutator) insertCall() bool {
+ 	return true
+ }
+ 
++// Inserts a new call at a randomly chosen point (with bias towards the end of
++// existing program). Does not insert a call if program already has ncalls.
++func (ctx *mutator) insertParticularCall(syscallId int, biasTail bool) bool {
++	p, r := ctx.p, ctx.r
++	if len(p.Calls) >= ctx.ncalls {
++		return false
++	}
++	var idx int
++	if biasTail {
++		idx = r.biasedRand(len(p.Calls)+1, 5)
++	}else{
++		idx = r.biasedRandReverse(len(p.Calls)+1, 5)
++	}
++	var c *Call
++	if idx < len(p.Calls) {
++		c = p.Calls[idx]
++	}
++	s := analyze(ctx.ct, ctx.corpus, p, c)
++	sid := syscallId
++	if sid < 0{
++		ruleid := -sid-1
++		syscallId = gfuzz.RuleCalls[ruleid].Id
++		gfuzz.UseRuleCall = gfuzz.RuleCalls[ruleid].Rules
++	}
++	calls := r.generateParticularCall(s, r.target.Syscalls[syscallId])
++	if sid < 0{
++		gfuzz.UseRuleCall = nil
++	}
++	p.insertBefore(c, calls)
++	for len(p.Calls) > ctx.ncalls {
++		p.removeCall(idx)
++	}
++	return true
++}
++
+ // Removes a random call from program.
+ func (ctx *mutator) removeCall() bool {
+ 	p, r := ctx.p, ctx.r
+diff --git a/prog/prog.go b/prog/prog.go
+index bcc86fb02..c6358822a 100644
+--- a/prog/prog.go
++++ b/prog/prog.go
+@@ -11,6 +11,7 @@ type Prog struct {
+ 	Target   *Target
+ 	Calls    []*Call
+ 	Comments []string
++	Idx      string
+ }
+ 
+ type Call struct {
+diff --git a/prog/prog_test.go b/prog/prog_test.go
+index 6586d1a1d..e5564aadf 100644
+--- a/prog/prog_test.go
++++ b/prog/prog_test.go
+@@ -195,7 +195,7 @@ func testCrossTarget(t *testing.T, target *Target, crossTargets []*Target) {
+ 		testCrossArchProg(t, p, crossTargets)
+ 		p, _ = Minimize(p, -1, false, func(*Prog, int) bool {
+ 			return rs.Int63()%2 == 0
+-		})
++		}, 0)
+ 		testCrossArchProg(t, p, crossTargets)
+ 	}
+ }
+diff --git a/prog/rand.go b/prog/rand.go
+index a78f7e343..504e98412 100644
+--- a/prog/rand.go
++++ b/prog/rand.go
+@@ -13,6 +13,7 @@ import (
+ 	"strings"
+ 
+ 	"github.com/google/syzkaller/pkg/ifuzz"
++	"github.com/google/syzkaller/gfuzz"
+ )
+ 
+ const (
+@@ -150,6 +151,12 @@ func (r *randGen) biasedRand(n, k int) int {
+ 	return int(bf)
+ }
+ 
++// biasedRandReverse returns a random int in range [0..n),
++//// probability of n-1 is k times lower than probability of 0.
++func (r *randGen) biasedRandReverse(n, k int) int{
++	return n-r.biasedRand(n, k)
++}
++
+ func (r *randGen) randArrayLen() uint64 {
+ 	const maxLen = 10
+ 	// biasedRand produces: 10, 9, ..., 1, 0,
+@@ -753,7 +760,15 @@ func (a *VmaType) generate(r *randGen, s *state, dir Dir) (arg Arg, calls []*Cal
+ }
+ 
+ func (a *FlagsType) generate(r *randGen, s *state, dir Dir) (arg Arg, calls []*Call) {
+-	return MakeConstArg(a, dir, r.flags(a.Vals, a.BitMask, 0)), nil
++	v := r.flags(a.Vals, a.BitMask, 0)
++	if gfuzz.UseRuleCall != nil {
++		if idx, ok := gfuzz.UseRuleCall[a.String()]; ok{
++			v = a.Vals[idx]
++		}
++	}
++	//fmt.Printf("flags generate: %v %v\n", a.String(), v)
++	
++	return MakeConstArg(a, dir, v), nil
+ }
+ 
+ func (a *ConstType) generate(r *randGen, s *state, dir Dir) (arg Arg, calls []*Call) {
+@@ -799,6 +814,13 @@ func (a *StructType) generate(r *randGen, s *state, dir Dir) (arg Arg, calls []*
+ 
+ func (a *UnionType) generate(r *randGen, s *state, dir Dir) (arg Arg, calls []*Call) {
+ 	index := r.Intn(len(a.Fields))
++	if gfuzz.UseRuleCall != nil {
++		if idx, ok := gfuzz.UseRuleCall[a.String()]; ok{
++			index = int(idx)
++		}
++	}
++	//fmt.Printf("union type generate: %v %v %v\n", a.String(), index, a.Fields[index].Type)
++	
+ 	optType, optDir := a.Fields[index].Type, a.Fields[index].Dir(dir)
+ 	opt, calls := r.generateArg(s, optType, optDir)
+ 	return MakeUnionArg(a, dir, opt, index), calls
+diff --git a/prog/rand_test.go b/prog/rand_test.go
+index 60cf28a1c..ee6221ecf 100644
+--- a/prog/rand_test.go
++++ b/prog/rand_test.go
+@@ -66,7 +66,7 @@ func generateProg(t *testing.T, target *Target, rs rand.Source, ct *ChoiceTable,
+ 	for _, crash := range []bool{false, true} {
+ 		p, _ = Minimize(p, -1, crash, func(*Prog, int) bool {
+ 			return rs.Int63()%10 == 0
+-		})
++		}, 0)
+ 	}
+ 	data := p.Serialize()
+ 	var err error
+diff --git a/prog/types.go b/prog/types.go
+index 482b20e2d..8aa53b129 100644
+--- a/prog/types.go
++++ b/prog/types.go
+@@ -118,6 +118,7 @@ type Type interface {
+ 	setRef(ref Ref)
+ }
+ 
++
+ type Ref uint32
+ 
+ func (ti Ref) String() string       { panic("prog.Ref method called") }
+diff --git a/sys/linux/vnet.txt b/sys/linux/vnet.txt
+index 97b3a82cf..0c48b7610 100644
+--- a/sys/linux/vnet.txt
++++ b/sys/linux/vnet.txt
+@@ -6,6 +6,54 @@ include <linux/byteorder/generic.h>
+ 
+ syz_emit_ethernet(len len[packet], packet ptr[in, eth_packet], frags ptr[in, vnet_fragmentation, opt])
+ 
++################################################################################
++############################## Added by GFuzz ##################################
++################################################################################
++
++syz_emit_ethernet$ipv4(len len[packet], packet ptr[in, gfuzz_eth_packet_t[gfuzz_ipv4_t, ipv4_packet]], frags ptr[in, vnet_fragmentation, opt])
++syz_emit_ethernet$ipv4_tcp(len len[packet], packet ptr[in, gfuzz_eth_packet_t[gfuzz_ipv4_t, ipv4_packet_tcp]], frags ptr[in, vnet_fragmentation, opt])
++syz_emit_ethernet$ipv4_udp(len len[packet], packet ptr[in, gfuzz_eth_packet_t[gfuzz_ipv4_t, ipv4_packet_udp]], frags ptr[in, vnet_fragmentation, opt])
++syz_emit_ethernet$ipv4_icmp(len len[packet], packet ptr[in, gfuzz_eth_packet_t[gfuzz_ipv4_t, ipv4_packet_icmp]], frags ptr[in, vnet_fragmentation, opt])
++syz_emit_ethernet$ipv4_igmp(len len[packet], packet ptr[in, gfuzz_eth_packet_t[gfuzz_ipv4_t, ipv4_packet_igmp]], frags ptr[in, vnet_fragmentation, opt])
++
++type gfuzz_eth_packet_t[ETH_PAYLOAD, PACKET_PAYLOAD] {
++	dst_mac	mac_addr
++	src_mac	mac_addr
++	vtag	optional[vlan_tag]
++	payload	ETH_PAYLOAD[PACKET_PAYLOAD]
++} [packed]
++
++type gfuzz_ipv4_t[PACKET_PAYLOAD] {
++	eth2	eth2_packet_t[ETH_P_IP, PACKET_PAYLOAD]
++} [packed]
++
++type ipv4_packet_tcp	ipv4_packet_t[const[IPPROTO_TCP, int8], tcp_packet]
++type ipv4_packet_udp	ipv4_packet_t[const[IPPROTO_UDP, int8], udp_packet]
++type ipv4_packet_icmp	ipv4_packet_t[const[IPPROTO_ICMP, int8], icmp_packet]
++type ipv4_packet_igmp	ipv4_packet_t[const[IPPROTO_IGMP, int8], igmp_packet]
++
++syz_emit_ethernet$ipv6(len len[packet], packet ptr[in, gfuzz_eth_packet_t[gfuzz_ipv6_t, ipv6_packet]], frags ptr[in, vnet_fragmentation, opt])
++syz_emit_ethernet$ipv6_tcp(len len[packet], packet ptr[in, gfuzz_eth_packet_t[gfuzz_ipv6_t, ipv6_packet_tcp]], frags ptr[in, vnet_fragmentation, opt])
++syz_emit_ethernet$ipv6_udp(len len[packet], packet ptr[in, gfuzz_eth_packet_t[gfuzz_ipv6_t, ipv6_packet_udp]], frags ptr[in, vnet_fragmentation, opt])
++syz_emit_ethernet$ipv6_icmp(len len[packet], packet ptr[in, gfuzz_eth_packet_t[gfuzz_ipv6_t, ipv6_packet_icmp]], frags ptr[in, vnet_fragmentation, opt])
++
++type gfuzz_ipv6_t[PACKET_PAYLOAD] {
++	eth2	eth2_packet_t[ETH_P_IPV6, PACKET_PAYLOAD]
++} [packed]
++
++type ipv6_packet_tcp	ipv6_packet_t[const[IPPROTO_TCP, int8], tcp_packet]
++type ipv6_packet_udp	ipv6_packet_t[const[IPPROTO_UDP, int8], udp_packet]
++type ipv6_packet_icmp	ipv6_packet_t[const[IPPROTO_ICMPV6, int8], icmpv6_packet]
++
++syz_emit_ethernet$arp(len len[packet], packet ptr[in, gfuzz_eth_packet_t[gfuzz_arp_t, arp_packet]], frags ptr[in, vnet_fragmentation, opt])
++
++type gfuzz_arp_t[PACKET_PAYLOAD] {
++	eth2	eth2_packet_t[ETH_P_ARP, PACKET_PAYLOAD]
++} [packed]
++
++### End of gfuzz add
++
++
+ vnet_fragmentation {
+ # If set and we have remaining data after fragmentation, it is written in an additional fragment.
+ # If not set, data remaining after fragmentation is discarded.
+diff --git a/sys/targets/targets.go b/sys/targets/targets.go
+index dd3977795..5f72eb123 100644
+--- a/sys/targets/targets.go
++++ b/sys/targets/targets.go
+@@ -657,7 +657,8 @@ func initTarget(target *Target, OS, arch string) {
+ 
+ func (target *Target) Timeouts(slowdown int) Timeouts {
+ 	if slowdown <= 0 {
+-		panic(fmt.Sprintf("bad slowdown %v", slowdown))
++		//panic(fmt.Sprintf("bad slowdown %v", slowdown))
++		slowdown = 1
+ 	}
+ 	timeouts := target.timeouts
+ 	timeouts.Slowdown = slowdown
+@@ -684,7 +685,7 @@ func (target *Target) Timeouts(slowdown int) Timeouts {
+ 		timeouts.NoOutput = 5 * time.Minute
+ 	}
+ 	if timeouts.VMRunningTime == 0 {
+-		timeouts.VMRunningTime = time.Hour
++		timeouts.VMRunningTime = 2 * time.Hour //GFuzz: change to 2 hour restart
+ 	}
+ 	timeouts.Syscall *= time.Duration(slowdown)
+ 	timeouts.Program *= timeouts.Scale
+diff --git a/syz-fuzzer/fuzzer.go b/syz-fuzzer/fuzzer.go
+index 98fbecd8e..4826b5c35 100644
+--- a/syz-fuzzer/fuzzer.go
++++ b/syz-fuzzer/fuzzer.go
+@@ -4,17 +4,23 @@
+ package main
+ 
+ import (
++	"bufio"
++	"encoding/json"
+ 	"flag"
+ 	"fmt"
++	"io/ioutil"
+ 	"math/rand"
+ 	"os"
+ 	"runtime"
+ 	"runtime/debug"
+ 	"sort"
++	"strconv"
++	"strings"
+ 	"sync"
+ 	"sync/atomic"
+ 	"time"
+ 
++	"github.com/google/syzkaller/gfuzz"
+ 	"github.com/google/syzkaller/pkg/csource"
+ 	"github.com/google/syzkaller/pkg/hash"
+ 	"github.com/google/syzkaller/pkg/host"
+@@ -49,24 +55,63 @@ type Fuzzer struct {
+ 	faultInjectionEnabled    bool
+ 	comparisonTracingEnabled bool
+ 
+-	corpusMu     sync.RWMutex
+-	corpus       []*prog.Prog
+-	corpusHashes map[hash.Sig]struct{}
+-	corpusPrios  []int64
+-	sumPrios     int64
++	corpusMu      sync.RWMutex
++	corpus        []*prog.Prog
++	corpusHashes  map[hash.Sig]uint
++	corpusPrios   []int64
++	corpusSignals []signal.Signal
++
++	enableDistance       bool
++	corpusDistance       []float32
++	corpusClosetDistance []int64
++	corpusClosetDistanceMap map[string]int64
++	corpusDistance_min   float32
++	corpusDistance_max   float32
++	useClosetDistance    bool
++
++	enablePCCFG bool
++	pccfg       map[uint32][]uint32 //pc to descendant pcs
++	boundary    map[uint32][]int    //pc to seed idxs
++
++	sumPrios int64
+ 
+ 	signalMu     sync.RWMutex
+ 	corpusSignal signal.Signal // signal of inputs in corpus
+ 	maxSignal    signal.Signal // max signal ever observed including flakes
+ 	newSignal    signal.Signal // diff of maxSignal since last sync with master
+ 
+-	logMu sync.Mutex
++	logMu                      sync.Mutex
++	pc2distance                map[uint64]int64
++	maxStaticDis               int64
++	seedExectimes              map[string]uint32
++	seedProfit                 map[string]uint32
++	cooling_tx                 int
++	startTime                  time.Time
++	StageStartTime             time.Time
++	LastNewSeedTime            time.Time
++	enablemoreSmash            int
++	directchooseEntertime      int
++	directchooseForceEntertime int
++	directchooseExittime       int
++	directchooseForceExittime  int
++	mimicBaseline              bool
++	useprogdis                 bool
++	SyscallSeedsHead           [][]int
++	SyscallSeedsTail           [][]int
++	MutateDirectChance         int
++	targetpc                   []uint32
++	mode                       string //"coverage", "directed", "generate"
++	gfuzzfilter                map[uint32]bool
+ }
+ 
+ type FuzzerSnapshot struct {
+-	corpus      []*prog.Prog
+-	corpusPrios []int64
+-	sumPrios    int64
++	corpus               []*prog.Prog
++	corpusPrios          []int64
++	sumPrios             int64
++	corpusDistance       []float32
++	corpusClosetDistance []int64
++	corpusDistance_min   float32
++	corpusDistance_max   float32
+ }
+ 
+ type Stat int
+@@ -127,9 +172,143 @@ func createIPCConfig(features *host.Features, config *ipc.Config) {
+ 	}
+ }
+ 
++func syscallIsGenerator(syscall *prog.Syscall) bool{
++	hasResource := false
++	for _, arg := range syscall.Args {
++		if _, ok := arg.Type.(*prog.ResourceType); ok {
++			hasResource = true
++		}
++		if ptr, ok := arg.Type.(*prog.PtrType); ok {
++			if _, ok2 := ptr.Elem.(*prog.ResourceType); ok2 {
++				hasResource = true
++			}
++		}
++	}
++	_, isReturnResource :=syscall.Ret.(*prog.ResourceType)
++	return !hasResource||isReturnResource
++}
++
++func SyscallExpand(basesyscalls []string, calls map[*prog.Syscall]bool, rulecalls []gfuzz.RuleInferredSyscalls, enableOrderInfer bool) (outHeadres, outTailres[][]int) {
++	basename2ids := make(map[string][][]int)
++
++	addcall := func(syscall *prog.Syscall, id int){
++		basecall := syscall.Name
++		if basename2ids[basecall] == nil{
++			basename2ids[basecall] = make([][]int, 2)
++			basename2ids[basecall][0] = make([]int, 0)
++			basename2ids[basecall][1] = make([]int, 0)
++		}
++		if enableOrderInfer && syscallIsGenerator(syscall){
++			basename2ids[basecall][0] = append(basename2ids[basecall][0], id)
++		}else{
++			basename2ids[basecall][1] = append(basename2ids[basecall][1], id)
++		}
++	}
++
++	for _, basecall := range basesyscalls {
++		for syscall := range calls {
++			if syscall.CallName == basecall || syscall.Name == basecall || syscall.Name==basecall[:len(basecall)-1] {
++				addcall(syscall, syscall.ID)
++			}
++		}
++	}
++	for i, item := range rulecalls{
++		for syscall := range calls{
++			if syscall.Name == item.Name{
++				addcall(syscall, -(i+1))
++			}
++		}
++	}
++	outHeadres = make([][]int, 0)
++	outTailres = make([][]int, 0)
++	for _, item := range basename2ids{
++		if len(item[0])>0{
++			outHeadres = append(outHeadres, item[0])
++		}
++		if len(item[1])>0{
++			outTailres = append(outTailres, item[1])
++		}
++	}
++
++	gfuzz.GFUZZlog("GFUZZ:SyscallExpand_Head %v", outHeadres)
++	gfuzz.GFUZZlog("GFUZZ:SyscallExpand_Tail %v", outTailres)
++	if fp, err := os.OpenFile("/workdir/syscalls_dynamic.txt", os.O_RDONLY, 0644); err == nil {
++		scanner := bufio.NewScanner(fp)
++		for scanner.Scan() {
++			lineStr := scanner.Text()
++			num, _ := strconv.Atoi(lineStr)
++			tmp := make([]int, 1)
++			tmp[0] = num
++			outTailres = append(outTailres, tmp)
++		}
++		gfuzz.GFUZZlog("GFUZZ:SyscallExpand_dynamic %v", outTailres)
++	}
++	return
++}
++
++func SyscallExpandv1(basesyscalls []string, calls map[*prog.Syscall]bool, rulecalls []gfuzz.RuleInferredSyscalls, enableOrderInfer bool) (outHeadres, outTailres[][]int) {
++	maxlength := len(basesyscalls)+len(rulecalls)
++	outHead := make([][]int, maxlength)
++	outTail := make([][]int, maxlength)
++	for i, basecall := range basesyscalls {
++		outHead[i] = make([]int, 0)
++		outTail[i] = make([]int, 0)
++		for syscall := range calls {
++			if syscall.CallName == basecall || syscall.Name == basecall || syscall.Name==basecall[:len(basecall)-1] {
++				if enableOrderInfer && syscallIsGenerator(syscall){
++					outHead[i] = append(outHead[i], syscall.ID)
++				}else{
++					outTail[i] = append(outTail[i], syscall.ID)
++				}
++			}
++		}
++	}
++	for i, item := range rulecalls{
++		outi := len(basesyscalls) + i
++		outHead[outi] = make([]int, 0)
++		outTail[outi] = make([]int, 0)
++		for syscall := range calls{
++			if syscall.Name == item.Name{
++				if enableOrderInfer && syscallIsGenerator(syscall){
++					outHead[outi] = append(outHead[outi], -(i+1))// gfuzz: we use negative syscall id as rulecalls' id
++				}else{
++					outTail[outi] = append(outTail[outi], -(i+1))
++				}
++			}
++		}
++	}
++	outHeadres = make([][]int, 0)
++	for _, item := range outHead{
++		if len(item)>0{
++			outHeadres = append(outHeadres, item)
++		}
++	}
++	outTailres = make([][]int, 0)
++	for _, item := range outTail{
++		if len(item)>0{
++			outTailres = append(outTailres, item)
++		}
++	}
++	gfuzz.GFUZZlog("GFUZZ:SyscallExpand_Head %v", outHeadres)
++	gfuzz.GFUZZlog("GFUZZ:SyscallExpand_Tail %v", outTailres)
++	if fp, err := os.OpenFile("/workdir/syscalls_dynamic.txt", os.O_RDONLY, 0644); err == nil {
++		scanner := bufio.NewScanner(fp)
++		for scanner.Scan() {
++			lineStr := scanner.Text()
++			num, _ := strconv.Atoi(lineStr)
++			tmp := make([]int, 1)
++			tmp[0] = num
++			outTailres = append(outTailres, tmp)
++		}
++		gfuzz.GFUZZlog("GFUZZ:SyscallExpand_dynamic %v", outTailres)
++	}
++	return
++}
++
+ // nolint: funlen
+ func main() {
+ 	debug.SetGCPercent(50)
++	gfuzz.GFUZZlog("GFUZZ:fuzzer_started")
+ 
+ 	var (
+ 		flagName    = flag.String("name", "test", "unique name for manager")
+@@ -219,6 +398,7 @@ func main() {
+ 		if r.CheckResult.Error != "" {
+ 			log.Fatalf("%v", r.CheckResult.Error)
+ 		}
++		r.StartTime = time.Now()
+ 	} else {
+ 		if err = host.Setup(target, r.CheckResult.Features, featureFlags, config.Executor); err != nil {
+ 			log.Fatal(err)
+@@ -237,6 +417,76 @@ func main() {
+ 
+ 	needPoll := make(chan struct{}, 1)
+ 	needPoll <- struct{}{}
++
++	var pc2dis map[uint64]int64 = make(map[uint64]int64)
++	enableDistance := true
++
++	hextoint := func(s string) uint32 {
++		kk := strings.Replace(s, "0x", "", -1)
++		kint, err := strconv.ParseUint(kk, 16, 32)
++		if err != nil {
++			panic(err)
++		}
++		return uint32(kint)
++	}
++
++	fdistance, err := os.Open("/distance.json")
++	maxStaticDis := int64(-1) // max distance inferred from static analysis, used in Smart Smash
++	if err == nil {
++		defer fdistance.Close()
++		byteValue, _ := ioutil.ReadAll(fdistance)
++		var tmp map[string]interface{}
++		err = json.Unmarshal([]byte(byteValue), &tmp)
++		if err != nil {
++			log.Fatalf("json.Unmarshal distance.json failed: %v", err)
++		}
++		for k, v := range tmp {
++			//fmt.Printf("%v : %v %T\n", k, v, v)
++			v2 := int64(v.(float64))
++			pc2dis[uint64(hextoint(k))] = v2
++			if v2>maxStaticDis{
++				maxStaticDis = v2
++			}
++		}
++	} else {
++		enableDistance = false
++	}
++
++	var pccfg map[uint32][]uint32 = make(map[uint32][]uint32)
++	enablePCCFG := true
++	fcfg, err := os.Open("/cfg.json")
++	if err == nil {
++		defer fcfg.Close()
++		byteValue, _ := ioutil.ReadAll(fcfg)
++		var tmp map[string]interface{}
++		err = json.Unmarshal([]byte(byteValue), &tmp)
++		if err != nil {
++			log.Fatalf("json.Unmarshal cfg.json failed: %v", err)
++		}
++		for k, v := range tmp {
++			//fmt.Printf("pccfg %v : %v %T\n", k, v, v)
++			vv := v.([]interface{})
++			pccfg[hextoint(k)] = make([]uint32, 0)
++			for _, i := range vv {
++				pccfg[hextoint(k)] = append(pccfg[hextoint(k)], hextoint(i.(string)))
++			}
++		}
++	} else {
++		enablePCCFG = false
++	}
++	//fmt.Printf("pccfg: %v", pccfg)
++	GFuzzFilter := make(map[uint32]bool)
++	fgfuzzfilter, err := os.Open("/gfuzzfilter.json")
++	defer fgfuzzfilter.Close()
++	if err == nil{
++		s := bufio.NewScanner(fgfuzzfilter)
++		for s.Scan() {
++			pc := hextoint(s.Text())
++			GFuzzFilter[pc] = true
++		}
++	}
++
++
+ 	fuzzer := &Fuzzer{
+ 		name:                     *flagName,
+ 		outputType:               outputType,
+@@ -249,7 +499,18 @@ func main() {
+ 		timeouts:                 timeouts,
+ 		faultInjectionEnabled:    r.CheckResult.Features[host.FeatureFault].Enabled,
+ 		comparisonTracingEnabled: r.CheckResult.Features[host.FeatureComparisons].Enabled,
+-		corpusHashes:             make(map[hash.Sig]struct{}),
++		corpusHashes:             make(map[hash.Sig]uint),
++		pc2distance:              pc2dis,
++		maxStaticDis:             maxStaticDis,
++		enableDistance:           enableDistance,
++		pccfg:                    pccfg,
++		enablePCCFG:              enablePCCFG,
++		corpusDistance_min:       1000,
++		boundary:                 make(map[uint32][]int),
++		seedExectimes:            make(map[string]uint32),
++		seedProfit:               make(map[string]uint32),
++		corpusClosetDistanceMap:  make(map[string]int64),
++		gfuzzfilter:              GFuzzFilter,
+ 	}
+ 	gateCallback := fuzzer.useBugFrames(r, *flagProcs)
+ 	fuzzer.gate = ipc.NewGate(2**flagProcs, gateCallback)
+@@ -264,11 +525,61 @@ func main() {
+ 	for _, id := range r.CheckResult.EnabledCalls[sandbox] {
+ 		calls[target.Syscalls[id]] = true
+ 	}
++
++	gfuzz.RuleCalls = make([]gfuzz.RuleInferredSyscalls, 0)
++	rc := make([]gfuzz.RuleInferredSyscalls, 0)
++	if err = json.Unmarshal([]byte(r.RuleCallsStr), &rc); err != nil{
++		log.Fatalf("unmarshal rulecalls failed: %v", err)
++	}
++	for _, item := range rc {
++		for syscall := range calls {
++			if item.Name == syscall.Name { //only add allowed syscalls to gfuzz.RuleCalls
++				item.Id = syscall.ID
++				gfuzz.RuleCalls = append(gfuzz.RuleCalls, item)
++				break
++			}
++		}
++	}
++
+ 	fuzzer.choiceTable = target.BuildChoiceTable(fuzzer.corpus, calls)
++	fuzzer.SyscallSeedsHead, fuzzer.SyscallSeedsTail = SyscallExpand(r.SyscallSeeds, calls, gfuzz.RuleCalls, r.EnableOrderInfer)
++	fuzzer.MutateDirectChance = r.MutateDirectChance
+ 
+ 	if r.EnabledCoverFilter {
+ 		fuzzer.execOpts.Flags |= ipc.FlagEnableCoverageFilter
+ 	}
++	if r.EnableRandomChoose {
++		fuzzer.execOpts.Flags |= ipc.FlagEnableRandomChoose
++	}
++	if r.EnableGlobalDistance {
++		fuzzer.execOpts.Flags |= ipc.FlagEnableGlobalDistance
++	}
++	if r.EnableSeedExecLimit {
++		fuzzer.execOpts.Flags |= ipc.FlagEnableSeedExecLimit
++	}
++	if r.CoolingTx > 0 {
++		fuzzer.cooling_tx = r.CoolingTx
++	}
++	fuzzer.startTime = r.StartTime
++	fuzzer.StageStartTime = r.StageStartTime
++	fuzzer.LastNewSeedTime = r.LastNewSeedTime
++	fuzzer.mode = r.Mode
++	if r.EnablemoreSmash > 0 {
++		fuzzer.enablemoreSmash = r.EnablemoreSmash
++	}
++	if r.UseClosetDistance {
++		fuzzer.useClosetDistance = true
++	}
++	if r.NoLog {
++		gfuzz.NoLog = true
++	}
++	fuzzer.directchooseEntertime = r.DirectchooseEntertime
++	fuzzer.directchooseForceEntertime = r.DirectchooseForceEntertime
++	fuzzer.directchooseExittime = r.DirectchooseExittime
++	fuzzer.directchooseForceExittime = r.DirectchooseForceExittime
++	fuzzer.mimicBaseline = r.MimicBaseline
++	fuzzer.useprogdis = r.UseProgDis
++	fuzzer.targetpc = r.TargetPC
+ 
+ 	log.Logf(0, "starting %v fuzzer processes", *flagProcs)
+ 	for pid := 0; pid < *flagProcs; pid++ {
+@@ -279,6 +590,10 @@ func main() {
+ 		fuzzer.procs = append(fuzzer.procs, proc)
+ 		go proc.loop()
+ 	}
++	if fuzzer.enablePCCFG {
++		go fuzzer.boundaryDeleteRoutine()
++	}
++	go fuzzer.showQueueRoutine()
+ 
+ 	fuzzer.pollLoop()
+ }
+@@ -409,6 +724,42 @@ func (fuzzer *Fuzzer) sendInputToManager(inp rpctype.RPCInput) {
+ 	}
+ }
+ 
++func (fuzzer *Fuzzer) StageExit() {
++	fuzzer.StageStartTime = time.Now()
++	fuzzer.LastNewSeedTime = time.Now()
++	a := fuzzer.name
++	if err := fuzzer.manager.Call("Manager.StageExit", a, nil); err != nil {
++		log.Logf(0, "Manager.StageExit call failed: %v", err)
++	}
++}
++
++func (fuzzer *Fuzzer) changeMode(newMode string){
++	gfuzz.GFUZZlog("GFUZZ:changeMode %v", newMode)
++	fuzzer.mode = newMode
++	a := &rpctype.ModeChange{
++		Name: fuzzer.name,
++		Mode: newMode,
++	}
++	if err := fuzzer.manager.Call("Manager.ChangeMode", a, nil); err != nil {
++		log.Fatalf("Manager.ChangeMode call failed: %v", err)
++	}
++}
++
++
++var TargetFound = make(map[uint32]bool)
++
++func (fuzzer *Fuzzer) notifyTargetFound(targetpc uint32) {
++	if _, ok := TargetFound[targetpc]; ok {
++		return
++	}
++	a := fmt.Sprintf("%x", targetpc)
++	if err := fuzzer.manager.Call("Manager.TargetFound", a, nil); err != nil {
++		log.Logf(0, "Manager.TargetFound call failed: %v", err)
++	} else {
++		TargetFound[targetpc] = true
++	}
++}
++
+ func (fuzzer *Fuzzer) addInputFromAnotherFuzzer(inp rpctype.RPCInput) {
+ 	p := fuzzer.deserializeInput(inp.Prog)
+ 	if p == nil {
+@@ -416,7 +767,7 @@ func (fuzzer *Fuzzer) addInputFromAnotherFuzzer(inp rpctype.RPCInput) {
+ 	}
+ 	sig := hash.Hash(inp.Prog)
+ 	sign := inp.Signal.Deserialize()
+-	fuzzer.addInputToCorpus(p, sign, sig)
++	fuzzer.addInputToCorpus(p, sign, inp.ProgSig.Deserialize(), sig)
+ }
+ 
+ func (fuzzer *Fuzzer) addCandidateInput(candidate rpctype.RPCCandidate) {
+@@ -445,22 +796,222 @@ func (fuzzer *Fuzzer) deserializeInput(inp []byte) *prog.Prog {
+ 	if len(p.Calls) > prog.MaxCalls {
+ 		return nil
+ 	}
++	sig := hash.Hash(p.Serialize())
++	p.Idx = sig.String()
+ 	return p
+ }
+ 
+-func (fuzzer *FuzzerSnapshot) chooseProgram(r *rand.Rand) *prog.Prog {
++func (fuzzer *FuzzerSnapshot) chooseProgram_idx(r *rand.Rand) int {
+ 	randVal := r.Int63n(fuzzer.sumPrios + 1)
+ 	idx := sort.Search(len(fuzzer.corpusPrios), func(i int) bool {
+ 		return fuzzer.corpusPrios[i] >= randVal
+ 	})
++	return idx
++}
++
++func (fuzzer *FuzzerSnapshot) chooseProgram(r *rand.Rand) *prog.Prog {
++	idx := fuzzer.chooseProgram_idx(r)
+ 	return fuzzer.corpus[idx]
+ }
+ 
+-func (fuzzer *Fuzzer) addInputToCorpus(p *prog.Prog, sign signal.Signal, sig hash.Sig) {
++func (fuzzer *Fuzzer) showQueueRoutine() {
++	ticker := time.NewTicker(60 * time.Second)
++	defer ticker.Stop()
++	for range ticker.C {
++		wq := fuzzer.workQueue
++		wq.mu.RLock()
++		gfuzz.GFUZZlog("GFUZZ:showqueue hp:%v smash:%v candidate:%v triage:%v triageCandidate:%v len_corpus:%v saved:%v",
++			len(wq.smashHighPriority), len(wq.smash), len(wq.candidate), len(wq.triage), len(wq.triageCandidate), len(fuzzer.corpus), len(wq.smashHighPrioritySaved)+len(wq.triageCandidateSaved)+len(wq.candidateSaved)+len(wq.triageSaved)+len(wq.smashSaved))
++		wq.mu.RUnlock()
++	}
++}
++
++func (fuzzer *Fuzzer) boundaryDeleteRoutine() {
++	ticker := time.NewTicker(60 * time.Second)
++	defer ticker.Stop()
++	for range ticker.C {
++		//GFUZZlog("boundaryDeleteRoutine: before lock")
++		fuzzer.corpusMu.Lock()
++		//GFUZZlog("boundaryDeleteRoutine: after lock")
++		cnt := 0
++		dellist := make([]uint32, 0)
++		for pc := range fuzzer.boundary {
++			shouldkeep := false
++			for _, descendant := range fuzzer.pccfg[pc] {
++				//GFUZZlog("boundaryDeleteRoutine: descendant %v %v %v", descendant, fuzzer.boundary[descendant], fuzzer.corpusSignal[descendant])
++				if _, ok := fuzzer.boundary[descendant]; !ok {
++					if _, ok := fuzzer.corpusSignal[descendant]; !ok {
++						shouldkeep = true //descendant not in boundary and corpusSignal
++					}
++				}
++			}
++			if !shouldkeep {
++				delete(fuzzer.boundary, pc)
++				dellist = append(dellist, pc)
++				cnt += 1
++			}
++		}
++		seedNoboundary := make([]int, 0)
++		for idx, sign := range fuzzer.corpusSignals {
++			// if this seed's all signals not in boundary, then we should treat this seed as useless
++			notinbounary := true
++			for seedpc := range sign {
++				if _, ok := fuzzer.boundary[seedpc]; ok {
++					if len(fuzzer.boundary[seedpc]) < 50 {
++						notinbounary = false
++					}
++				}
++			}
++			if notinbounary {
++				seedNoboundary = append(seedNoboundary, idx)
++			}
++		}
++		validboundary_cnt := 0
++		for _, v := range fuzzer.boundary {
++			if len(v) < 50 {
++				validboundary_cnt += 1
++			}
++		}
++		gfuzz.GFUZZlog("GFUZZ:boundaryDeleteRoutine seedNoboundary:%v len:%d valid_len:%v delete:%d %v", len(seedNoboundary), len(fuzzer.boundary), validboundary_cnt, cnt, dellist)
++		file, err := os.OpenFile("/workdir/boundary.txt", os.O_CREATE|os.O_WRONLY, 0666)
++		if err == nil {
++			buf := bufio.NewWriter(file)
++			for i, j := range fuzzer.boundary {
++				fmt.Fprintf(buf, "0x%x %v\n", i, j)
++			}
++			buf.Flush()
++		}
++		file.Close()
++		fuzzer.corpusMu.Unlock()
++	}
++}
++
++func (fuzzer *Fuzzer) addInputToCorpus(p *prog.Prog, sign signal.Signal, progSig signal.Signal, sig hash.Sig) {
+ 	fuzzer.corpusMu.Lock()
++	var newidx uint
++	var isnewseed bool
++	if _newidx, ok := fuzzer.corpusHashes[sig]; ok {
++		newidx = _newidx
++		isnewseed = false
++	} else {
++		newidx = uint(len(fuzzer.corpus))
++		isnewseed = true
++	}
++	if !fuzzer.enableDistance {
++		gfuzz.GFUZZlog("GFUZZ:addInputToCorpus %v idx:%v from:%v status:%v isnew:%v", sig.String(), newidx, p.Idx, gfuzz.Status, isnewseed)
++	}
++	if p.Idx != "" {
++		fuzzer.seedProfit[p.Idx]++
++	}
++	for _, targetpc := range fuzzer.targetpc {
++		if _, ok := progSig[targetpc]; ok {
++			fuzzer.notifyTargetFound(targetpc)
++		}
++	}
++	if fuzzer.enableDistance {
++		var energysum, energycnt int64
++		seedClosestdistance := int64(1000)
++		for i := range progSig {
++			d, ok := fuzzer.pc2distance[uint64(i)]
++			if ok {
++				energysum += d
++				energycnt += 1
++				if d < seedClosestdistance {
++					seedClosestdistance = d
++				}
++			}
++		}
++		seed_distance := float32(energysum) / float32(energycnt)
++		if fuzzer.useClosetDistance {
++			seed_distance = float32(seedClosestdistance)
++		}
++		if seedClosestdistance == 0 {
++			fuzzer.manager.Call("Manager.TargetFound", "closet0", nil)
++		}
++		if parentClosetDis, ok := fuzzer.corpusClosetDistanceMap[p.Idx]; ok{
++			if seedClosestdistance < parentClosetDis{
++				// this seed make progress in distance metric, let's add its syscalls to fuzzer.SyscallSeeds
++				// only syscalls that already in SyscallSeeds are considered
++				// to make it persistent, also write to syscalls_dynamic.txt
++				allCalls := make(map[int]bool, 0)
++				for _, ids := range fuzzer.SyscallSeedsTail {
++					for _, id := range ids {
++						allCalls[id] = true
++					}
++				}
++				for _,call := range p.Calls{
++					callid := call.Meta.ID
++					if _, ok := allCalls[callid]; ok{
++						tmp := make([]int, 1)
++						tmp[0] = callid
++						gfuzz.GFUZZlog("GFUZZ:dynamic_syscall %v %v", callid, call.Meta.Name)
++						fuzzer.SyscallSeedsTail = append(fuzzer.SyscallSeedsTail, tmp)
++						if fp, err := os.OpenFile("/workdir/syscalls_dynamic.txt", os.O_APPEND|os.O_WRONLY|os.O_CREATE, 0644); err == nil{
++							fmt.Fprintf(fp, "%d\n", callid)
++							fp.Close()
++						}
++					}
++				}
++			}
++		}
++		if gfuzz.Status!="" {
++			gfuzz.GFUZZlog("GFUZZ:addInputToCorpus_distance %v dis:%v closet:%v idx:%v from:%v status:%v isnew:%v",
++				sig.String(), seed_distance, seedClosestdistance, newidx, p.Idx, gfuzz.Status, isnewseed)
++		}
++		if isnewseed {
++			fuzzer.corpusDistance = append(fuzzer.corpusDistance, seed_distance)
++			fuzzer.corpusClosetDistance = append(fuzzer.corpusClosetDistance, seedClosestdistance)
++			fuzzer.corpusClosetDistanceMap[sig.String()] = seedClosestdistance
++		} else {
++			if seed_distance < fuzzer.corpusDistance[newidx] {
++				fuzzer.corpusDistance[newidx] = seed_distance
++			}
++			if seedClosestdistance < fuzzer.corpusClosetDistance[newidx] {
++				fuzzer.corpusClosetDistance[newidx] = seedClosestdistance
++				fuzzer.corpusClosetDistanceMap[sig.String()] = seedClosestdistance
++			}
++		}
++		if seed_distance > fuzzer.corpusDistance_max {
++			fuzzer.corpusDistance_max = seed_distance
++		}
++		if seed_distance < fuzzer.corpusDistance_min {
++			fuzzer.corpusDistance_min = seed_distance
++		}
++	}
++	if fuzzer.enablePCCFG {
++		for i := range progSig {
++			pc := uint32(i)
++			if _, ok := fuzzer.boundary[pc]; ok {
++				fuzzer.boundary[pc] = append(fuzzer.boundary[pc], int(newidx))
++				continue // already in boundary
++			}
++			if _, ok := fuzzer.corpusSignal[pc]; ok {
++				continue // already in corpus
++			}
++			shouldkeep := false
++			for descendant := range fuzzer.pccfg[pc] {
++				if _, ok := progSig[uint32(descendant)]; !ok {
++					if _, ok := fuzzer.corpusSignal[uint32(descendant)]; !ok {
++						shouldkeep = true // at least one descendant not found
++					}
++				}
++			}
++			if !shouldkeep {
++				continue
++			}
++			fuzzer.boundary[pc] = make([]int, 0)
++			fuzzer.boundary[pc] = append(fuzzer.boundary[pc], len(fuzzer.corpus))
++		}
++	}
++	p.Idx = sig.String()
++	if isnewseed {
++		fuzzer.corpusSignals = append(fuzzer.corpusSignals, progSig)
++	} else {
++		fuzzer.corpusSignals[newidx].Merge(progSig)
++	}
+ 	if _, ok := fuzzer.corpusHashes[sig]; !ok {
+ 		fuzzer.corpus = append(fuzzer.corpus, p)
+-		fuzzer.corpusHashes[sig] = struct{}{}
++		fuzzer.corpusHashes[sig] = newidx
+ 		prio := int64(len(sign))
+ 		if sign.Empty() {
+ 			prio = 1
+@@ -481,7 +1032,15 @@ func (fuzzer *Fuzzer) addInputToCorpus(p *prog.Prog, sign signal.Signal, sig has
+ func (fuzzer *Fuzzer) snapshot() FuzzerSnapshot {
+ 	fuzzer.corpusMu.RLock()
+ 	defer fuzzer.corpusMu.RUnlock()
+-	return FuzzerSnapshot{fuzzer.corpus, fuzzer.corpusPrios, fuzzer.sumPrios}
++	return FuzzerSnapshot{
++		fuzzer.corpus,
++		fuzzer.corpusPrios,
++		fuzzer.sumPrios,
++		fuzzer.corpusDistance,
++		fuzzer.corpusClosetDistance,
++		fuzzer.corpusDistance_min,
++		fuzzer.corpusDistance_max,
++	}
+ }
+ 
+ func (fuzzer *Fuzzer) addMaxSignal(sign signal.Signal) {
+diff --git a/syz-fuzzer/fuzzer_test.go b/syz-fuzzer/fuzzer_test.go
+index dae8329f7..ebbbb4c26 100644
+--- a/syz-fuzzer/fuzzer_test.go
++++ b/syz-fuzzer/fuzzer_test.go
+@@ -24,7 +24,7 @@ func TestChooseProgram(t *testing.T) {
+ 	rs := rand.NewSource(0)
+ 	r := rand.New(rs)
+ 	target := getTarget(t, targets.TestOS, targets.TestArch64)
+-	fuzzer := &Fuzzer{corpusHashes: make(map[hash.Sig]struct{})}
++	fuzzer := &Fuzzer{corpusHashes: make(map[hash.Sig]uint)}
+ 
+ 	const (
+ 		maxIters   = 1000
+@@ -39,7 +39,7 @@ func TestChooseProgram(t *testing.T) {
+ 			sizeSig = 0
+ 		}
+ 		inp := generateInput(target, rs, 10, sizeSig)
+-		fuzzer.addInputToCorpus(inp.p, inp.sign, inp.sig)
++		fuzzer.addInputToCorpus(inp.p, inp.sign, inp.sign, inp.sig)
+ 		priorities[inp.p] = int64(len(inp.sign))
+ 	}
+ 	snapshot := fuzzer.snapshot()
+@@ -58,7 +58,7 @@ func TestChooseProgram(t *testing.T) {
+ 
+ func TestAddInputConcurrency(t *testing.T) {
+ 	target := getTarget(t, targets.TestOS, targets.TestArch64)
+-	fuzzer := &Fuzzer{corpusHashes: make(map[hash.Sig]struct{})}
++	fuzzer := &Fuzzer{corpusHashes: make(map[hash.Sig]uint)}
+ 
+ 	const (
+ 		routines = 10
+@@ -71,7 +71,7 @@ func TestAddInputConcurrency(t *testing.T) {
+ 			r := rand.New(rs)
+ 			for it := 0; it < iters; it++ {
+ 				inp := generateInput(target, rs, 10, it)
+-				fuzzer.addInputToCorpus(inp.p, inp.sign, inp.sig)
++				fuzzer.addInputToCorpus(inp.p, inp.sign, inp.sign, inp.sig)
+ 				snapshot := fuzzer.snapshot()
+ 				snapshot.chooseProgram(r).Clone()
+ 			}
+diff --git a/syz-fuzzer/proc.go b/syz-fuzzer/proc.go
+index 0d1d4c134..844d687c0 100644
+--- a/syz-fuzzer/proc.go
++++ b/syz-fuzzer/proc.go
+@@ -6,9 +6,12 @@ package main
+ import (
+ 	"bytes"
+ 	"fmt"
++	"github.com/google/syzkaller/gfuzz"
++	"math"
+ 	"math/rand"
+ 	"os"
+ 	"runtime/debug"
++	"sort"
+ 	"sync/atomic"
+ 	"syscall"
+ 	"time"
+@@ -32,6 +35,9 @@ type Proc struct {
+ 	execOptsCover     *ipc.ExecOpts
+ 	execOptsComps     *ipc.ExecOpts
+ 	execOptsNoCollide *ipc.ExecOpts
++	exectimes         uint32
++	newseeds          uint32
++	startTime         time.Time
+ }
+ 
+ func newProc(fuzzer *Fuzzer, pid int) (*Proc, error) {
+@@ -46,6 +52,7 @@ func newProc(fuzzer *Fuzzer, pid int) (*Proc, error) {
+ 	execOptsCover.Flags |= ipc.FlagCollectCover
+ 	execOptsComps := execOptsNoCollide
+ 	execOptsComps.Flags |= ipc.FlagCollectComps
++	gfuzz.GFUZZlog("proc execOpts: %v, execOptsCover: %v", fuzzer.execOpts, execOptsCover)
+ 	proc := &Proc{
+ 		fuzzer:            fuzzer,
+ 		pid:               pid,
+@@ -55,55 +62,408 @@ func newProc(fuzzer *Fuzzer, pid int) (*Proc, error) {
+ 		execOptsCover:     &execOptsCover,
+ 		execOptsComps:     &execOptsComps,
+ 		execOptsNoCollide: &execOptsNoCollide,
++		startTime:         fuzzer.startTime,
+ 	}
+ 	return proc, nil
+ }
+ 
++func (proc *Proc) loopGenerate() {
++	gfuzz.GFUZZlog("GFUZZ:loopGenerate")
++	proc.fuzzer.changeMode("generate")
++	startTime := proc.fuzzer.startTime // manager start time
++	shouldContinue := func() bool {
++		if time.Since(proc.fuzzer.LastNewSeedTime).Seconds() < 180 && time.Since(startTime).Seconds() < 1800 {
++			// exit generate mode when it stucks over 3 minutes, and at most 30 minutes
++			return true
++		}
++		return false
++	}
++	defer func() {
++		proc.fuzzer.workQueue.mu.Lock()
++		proc.fuzzer.workQueue.smash, proc.fuzzer.workQueue.smashSaved = proc.fuzzer.workQueue.smashSaved, proc.fuzzer.workQueue.smash
++		proc.fuzzer.workQueue.mu.Unlock()
++		proc.fuzzer.StageExit()
++	}()
++	for round := 0; shouldContinue(); round++ {
++		//gfuzz.GFUZZlog("GFUZZ:loopGenerate round:%v", round)
++
++		syscallIds := make([]int, 0)
++		trytimes := 0
++		if len(proc.fuzzer.SyscallSeedsHead)>0 {
++			for len(syscallIds) < 1 || proc.rnd.Intn(5) > 0 {
++				trytimes += 1
++				if trytimes > 100 {
++					gfuzz.GFUZZlog("GFUZZ:ERROR cannot generate enough syscallids within 100 tries HEAD")
++					return
++				}
++				basecall_i := proc.rnd.Intn(len(proc.fuzzer.SyscallSeedsHead))
++				if len(proc.fuzzer.SyscallSeedsHead[basecall_i]) == 0 {
++					continue
++				}
++				syscallId := proc.fuzzer.SyscallSeedsHead[basecall_i][proc.rnd.Intn(len(proc.fuzzer.SyscallSeedsHead[basecall_i]))]
++				syscallIds = append(syscallIds, syscallId)
++			}
++		}
++		if len(proc.fuzzer.SyscallSeedsTail)>0 {
++			for len(syscallIds) < 1 || proc.rnd.Intn(5) > 0 {
++				trytimes += 1
++				if trytimes > 100 {
++					gfuzz.GFUZZlog("GFUZZ:ERROR cannot generate enough syscallids within 100 tries TAIL")
++					return
++				}
++				basecall_i := proc.rnd.Intn(len(proc.fuzzer.SyscallSeedsTail))
++				if len(proc.fuzzer.SyscallSeedsTail[basecall_i]) == 0 {
++					continue
++				}
++				syscallId := proc.fuzzer.SyscallSeedsTail[basecall_i][proc.rnd.Intn(len(proc.fuzzer.SyscallSeedsTail[basecall_i]))]
++				syscallIds = append(syscallIds, syscallId)
++			}
++		}
++		//gfuzz.GFUZZlog("GFUZZ:GeneratebySyscall syscallIds:%v", syscallIds)
++
++		ct := proc.fuzzer.choiceTable
++		p := proc.fuzzer.target.GeneratebySyscall(proc.rnd, prog.RecommendedCalls, ct, syscallIds)
++
++		//gfuzz.GFUZZlog("GFUZZ:loopGenerate_generate %v >>>\n%v<<<", syscallIds, string(p.Serialize()))
++		gfuzz.Status = "Ggenerate"
++		proc.execute(proc.execOpts, p, ProgNormal, StatGenerate)
++
++		item := proc.fuzzer.workQueue.dequeue()
++		for item != nil {
++			switch item := item.(type) {
++			case *WorkTriage:
++				gfuzz.Status = "Gtriage+" + item.status
++				proc.triageInput(item)
++			case *WorkCandidate:
++				gfuzz.Status = "Gcandidate"
++				proc.execute(proc.execOpts, item.p, item.flags, StatCandidate)
++			case *WorkSmash:
++				gfuzz.Status = "Gsmash"
++				shouldSmashNow := false
++				for pc := range item.newSignal {
++					if dis, ok := proc.fuzzer.pc2distance[uint64(pc)]; ok && dis < 10 {
++						shouldSmashNow = true
++						break
++					}
++				}
++				if shouldSmashNow {
++					proc.smashInput(item)
++				} else {
++					item.times = 10 // do less repeat times for unrelated ones
++					proc.fuzzer.workQueue.mu.Lock()
++					proc.fuzzer.workQueue.smashSaved = append(proc.fuzzer.workQueue.smashSaved, item)
++					proc.fuzzer.workQueue.mu.Unlock()
++					//gfuzz.GFUZZlog("GFUZZ:skip_smash %v len(saved):%v", item.p.Idx, len(proc.fuzzer.workQueue.smashSaved))
++				}
++			default:
++				log.Fatalf("unknown work type: %#v", item)
++			}
++			item = proc.fuzzer.workQueue.dequeue()
++		}
++	}
++
++}
++
++func (proc *Proc) loopDirected() {
++	proc.fuzzer.changeMode("directed")
++	savedLen, newLen := proc.fuzzer.workQueue.Stash()
++	gfuzz.GFUZZlog("GFUZZ:loopDirected savedLen:%v newLen:%v LastNewSeedTime:%v StageStartTime:%v corpusLen:%v", savedLen, newLen, proc.fuzzer.LastNewSeedTime, proc.fuzzer.StageStartTime, len(proc.fuzzer.corpus))
++	defer func() {
++		gfuzz.GFUZZlog("GFUZZ:loopDirected_exit recovered:%v", proc.fuzzer.workQueue.StashPop())
++		proc.fuzzer.StageExit()
++	}()
++	shouldContinue := func() bool {
++		//gfuzz.GFUZZlog("GFUZZ:shouldContinue1 %v %v %v", proc.fuzzer.StageStartTime, time.Since(proc.fuzzer.StageStartTime).Seconds(), float64(proc.fuzzer.directchooseForceExittime))
++		//gfuzz.GFUZZlog("GFUZZ:shouldContinue2 %v %v %v", proc.fuzzer.LastNewSeedTime, time.Since(proc.fuzzer.LastNewSeedTime).Seconds(), float64(proc.fuzzer.directchooseExittime))
++		return time.Since(proc.fuzzer.StageStartTime).Seconds() <= float64(proc.fuzzer.directchooseForceExittime) &&
++			time.Since(proc.fuzzer.LastNewSeedTime).Seconds() <= float64(proc.fuzzer.directchooseExittime)
++	}
++	for round := 0; shouldContinue(); round++ {
++		gfuzz.GFUZZlog("GFUZZ:loopDirected round:%v", round)
++		fuzzerSnapshot := proc.fuzzer.snapshot()
++		chooseidx := make([]int, 0)
++		for i := 0; i < 100; i++ {
++			idx := proc.rnd.Intn(len(fuzzerSnapshot.corpus))
++			if idx >= len(fuzzerSnapshot.corpus) {
++				continue
++			}
++			chooseidx = append(chooseidx, idx)
++		}
++		sort.SliceStable(chooseidx, func(_i int, _j int) bool {
++			i := chooseidx[_i]
++			j := chooseidx[_j]
++			if proc.fuzzer.corpusClosetDistance[i] == proc.fuzzer.corpusClosetDistance[j] {
++				return proc.fuzzer.corpusDistance[i] < proc.fuzzer.corpusDistance[j]
++			}
++			return proc.fuzzer.corpusClosetDistance[i] < proc.fuzzer.corpusClosetDistance[j]
++		})
++		//gfuzz.GFUZZlog("GFUZZ:loopDirected chooseidx:%v", chooseidx)
++
++		for i := 0; i < 30; i++ {
++			//gfuzz.GFUZZlog("GFUZZ:loopDirected_loop30 round:%v i:%v len_triage:%v s:%v len_smash:%v ss:%v",
++			//	round, i, len(proc.fuzzer.workQueue.triage), len(proc.fuzzer.workQueue.triageSaved), len(proc.fuzzer.workQueue.smash), len(proc.fuzzer.workQueue.smashSaved))
++
++			ct := proc.fuzzer.choiceTable
++
++			// Mutate an existing prog.
++			idx := chooseidx[i]
++			p := fuzzerSnapshot.corpus[idx].Clone()
++			//gfuzz.GFUZZlog("GFUZZ:loopDirected execute i:%v idx:%v p.Idx:%v avg:%v closetdistance:%v",
++			//	i, idx, p.Idx, proc.fuzzer.corpusDistance[idx], proc.fuzzer.corpusClosetDistance[idx])
++			gfuzz.Status = fmt.Sprintf("loop_directed %v", idx)
++			elapsed_time := time.Since(proc.fuzzer.startTime).Seconds()
++			chance := proc.fuzzer.MutateDirectChance
++			chance -= int(elapsed_time/3600*10)
++			if chance < 20 {
++				chance = 20
++			}
++			p.Mutate(proc.rnd, prog.RecommendedCalls, ct, fuzzerSnapshot.corpus,
++				proc.fuzzer.SyscallSeedsHead, proc.fuzzer.SyscallSeedsTail, chance)
++			log.Logf(1, "#%v: mutated", proc.pid)
++			proc.execute(proc.execOpts, p, ProgNormal, StatFuzz)
++		}
++		//gfuzz.GFUZZlog("GFUZZ:loopDirected_after30 round:%v len_triage:%v", round, len(proc.fuzzer.workQueue.triage))
++
++		item := proc.fuzzer.workQueue.dequeue()
++		for item != nil {
++			switch item := item.(type) {
++			case *WorkTriage:
++				gfuzz.Status = "Dtriage+" + item.status
++				proc.triageInput(item)
++			case *WorkCandidate:
++				gfuzz.Status = "Dcandidate"
++				proc.execute(proc.execOpts, item.p, item.flags, StatCandidate)
++			case *WorkSmash:
++				gfuzz.Status = "Dsmash"
++				proc.smashInput(item)
++			default:
++				log.Fatalf("unknown work type: %#v", item)
++			}
++			item = proc.fuzzer.workQueue.dequeue()
++		}
++	}
++}
++
++
+ func (proc *Proc) loop() {
++	// recover last mode, do not change timestamp in enter mode, only do that after a mode exit
++	logprefix := "recover"
++	switch proc.fuzzer.mode{
++	case "init":
++		logprefix = "init"
++		fallthrough
++	case "generate":
++		if len(proc.fuzzer.SyscallSeedsHead) > 0 || len(proc.fuzzer.SyscallSeedsTail) > 0 {
++			gfuzz.GFUZZlog("GFUZZ:%v loopGenerate start", logprefix)
++			proc.loopGenerate()
++			gfuzz.GFUZZlog("GFUZZ:%v loopGenerate finished", logprefix)
++		}
++		fallthrough
++	case "directed":
++		if len(proc.fuzzer.corpus) > 100 && proc.fuzzer.directchooseEntertime > 0 {
++			gfuzz.GFUZZlog("GFUZZ:%v loopDirected start", logprefix)
++			proc.loopDirected()
++			gfuzz.GFUZZlog("GFUZZ:%v loopDirected finished", logprefix)
++		}
++	case "coverage":
++		gfuzz.GFUZZlog("GFUZZ:recover coverage start")
++	default:
++		gfuzz.GFUZZlog("GFUZZ:error unknown Mode: %v", proc.fuzzer.mode)
++	}
++	proc.fuzzer.changeMode("coverage")
++
+ 	generatePeriod := 100
++	userandom := proc.execOpts.Flags&ipc.FlagEnableRandomChoose != 0
++	useglobaldistance := proc.execOpts.Flags&ipc.FlagEnableGlobalDistance != 0
++	useseedlimit := proc.execOpts.Flags&ipc.FlagEnableSeedExecLimit != 0
++	usecooling := proc.fuzzer.cooling_tx > 0
++	t_x := proc.fuzzer.cooling_tx //time to exploit for cooling schedule
++	gfuzz.GFUZZlog("GFUZZ:procloop userandom:%v useglobaldistance:%v useseedlimit:%v cooling_t_x:%v starttime:%v useclosetdistance:%v", userandom, useglobaldistance, useseedlimit, t_x, proc.startTime, proc.fuzzer.useClosetDistance)
+ 	if proc.fuzzer.config.Flags&ipc.FlagSignal == 0 {
+ 		// If we don't have real coverage signal, generate programs more frequently
+ 		// because fallback signal is weak.
+ 		generatePeriod = 2
+ 	}
++	var oldp *prog.Prog
++	var energy int
++	var idx int
+ 	for i := 0; ; i++ {
+ 		item := proc.fuzzer.workQueue.dequeue()
+ 		if item != nil {
+ 			switch item := item.(type) {
+ 			case *WorkTriage:
++				//gfuzz.GFUZZlog("GFUZZ:task Triage")
++				gfuzz.Status = "triage+" + item.status
+ 				proc.triageInput(item)
+ 			case *WorkCandidate:
++				//gfuzz.GFUZZlog("GFUZZ:task Candidate")
++				gfuzz.Status = "candidate"
+ 				proc.execute(proc.execOpts, item.p, item.flags, StatCandidate)
+ 			case *WorkSmash:
++				//gfuzz.GFUZZlog("GFUZZ:task Smash")
++				gfuzz.Status = "smash"
+ 				proc.smashInput(item)
+ 			default:
+ 				log.Fatalf("unknown work type: %#v", item)
+ 			}
+-			continue
++			if proc.rnd.Int63n(5) > 1 {
++				continue
++			}
+ 		}
+ 
+ 		ct := proc.fuzzer.choiceTable
+ 		fuzzerSnapshot := proc.fuzzer.snapshot()
+-		if len(fuzzerSnapshot.corpus) == 0 || i%generatePeriod == 0 {
++		var usedTime time.Duration
++		if len(fuzzerSnapshot.corpus) < 10 || i%generatePeriod == 0 {
+ 			// Generate a new prog.
+ 			p := proc.fuzzer.target.Generate(proc.rnd, prog.RecommendedCalls, ct)
+-			log.Logf(1, "#%v: generated", proc.pid)
++			//gfuzz.GFUZZlog("GFUZZ:generated %v", p)
++			gfuzz.Status = "generate"
+ 			proc.execute(proc.execOpts, p, ProgNormal, StatGenerate)
+ 		} else {
++			if len(fuzzerSnapshot.corpus) > 100 && proc.fuzzer.directchooseEntertime > 0 &&
++				(time.Since(proc.fuzzer.StageStartTime).Seconds() > float64(proc.fuzzer.directchooseForceEntertime) ||
++					time.Since(proc.fuzzer.LastNewSeedTime).Seconds() > float64(proc.fuzzer.directchooseEntertime)) {
++				proc.fuzzer.StageExit() // exit from coverage, change to directed mode
++				proc.loopDirected()
++				gfuzz.GFUZZlog("GFUZZ:after_loopDirected")
++				proc.fuzzer.changeMode("coverage")
++			}
+ 			// Mutate an existing prog.
+-			p := fuzzerSnapshot.chooseProgram(proc.rnd).Clone()
+-			p.Mutate(proc.rnd, prog.RecommendedCalls, ct, fuzzerSnapshot.corpus)
++			var p *prog.Prog
++			if energy > 0 && usedTime < 60*time.Second {
++				energy--
++				p = oldp.Clone()
++				//gfuzz.GFUZZlog("GFUZZ:oldprog %v %v %v", idx, p.Idx, energy)
++				gfuzz.Status = fmt.Sprintf("use_energy %v %v", idx, energy)
++			} else {
++				if usedTime >= 60*time.Second {
++					gfuzz.GFUZZlog("GFUZZ:energy_timeout %v energy:%v", oldp.Idx, energy)
++				}
++				if userandom {
++					idx = proc.rnd.Intn(len(fuzzerSnapshot.corpus))
++					gfuzz.Status = fmt.Sprintf("choose_random %v", idx)
++				} else {
++					idx = fuzzerSnapshot.chooseProgram_idx(proc.rnd)
++					gfuzz.Status = fmt.Sprintf("choose_signal %v", idx)
++				}
++				if idx >= len(fuzzerSnapshot.corpus) {
++					continue
++				}
++
++				p = fuzzerSnapshot.corpus[idx].Clone()
++				usedTime = 0 * time.Second
++				var seedcost, avgcost float64
++				if (proc.execOpts.Flags&ipc.FlagEnableSeedExecLimit != 0) && proc.newseeds > 10 {
++					avgcost = float64(proc.exectimes) / float64(proc.newseeds)
++					if proc.fuzzer.seedProfit[p.Idx] > 0 {
++						seedcost = float64(proc.fuzzer.seedExectimes[p.Idx]) / float64(proc.fuzzer.seedProfit[p.Idx])
++					} else {
++						seedcost = float64(proc.fuzzer.seedExectimes[p.Idx])
++					}
++					if seedcost > 2*avgcost && seedcost > 20 {
++						gfuzz.GFUZZlog("GFUZZ:skipexecute %v status:%v seedcost:%v avgcost:%v exectimes:%v", p.Idx, gfuzz.Status, seedcost, avgcost, proc.exectimes)
++						continue
++					}
++				}
++
++				if !proc.fuzzer.mimicBaseline && proc.fuzzer.enableDistance {
++					//we only use energy when enabled distance and not moreSmash mode
++					var T float64
++					seedDistantce := (fuzzerSnapshot.corpusDistance[idx] - fuzzerSnapshot.corpusDistance_min) / (fuzzerSnapshot.corpusDistance_max - fuzzerSnapshot.corpusDistance_min)
++					//energy = int((1 - seedDistantce) * 32)
++					if usecooling {
++						progress_to_tx := time.Now().Sub(proc.startTime).Seconds() / float64(t_x)
++						if progress_to_tx > 2 {
++							T = 0
++						} else {
++							T = math.Pow(20.0, -progress_to_tx)
++						}
++						p := (1.0-float64(seedDistantce))*(1.0-T) + 0.5*T
++						energy = int(math.Pow(2.0, 7*(p))) - 1
++					} else if useglobaldistance {
++						maxweight := 7 * float64(1-fuzzerSnapshot.corpusDistance_min/fuzzerSnapshot.corpusDistance_max)
++						energy = int(math.Pow(2, maxweight*float64(1-seedDistantce)))
++					} else {
++						energy = int(math.Pow(2, 7*float64(1-seedDistantce)))
++					}
++					if fuzzerSnapshot.corpusClosetDistance[idx] < 20 {
++						energy *= 2
++					}
++					if fuzzerSnapshot.corpusClosetDistance[idx] < 10 {
++						energy *= 2
++					}
++					oldp = p.Clone()
++					pcinboundary := make([]uint32, 0)
++					if proc.fuzzer.enablePCCFG {
++						seedsignal := proc.fuzzer.corpusSignals[idx]
++						for seedpc := range seedsignal {
++							if _, ok := proc.fuzzer.boundary[seedpc]; ok {
++								if len(proc.fuzzer.boundary[seedpc]) < 50 { // if a boundary has more than 50 seeds, we treat it as a really hard boundary and skip it
++									pcinboundary = append(pcinboundary, seedpc)
++								}
++							}
++						}
++						energy *= int(math.Min(float64(len(pcinboundary)+1), 5))
++					}
++					//gfuzz.GFUZZlog("GFUZZ:choose idx:%v %v distance:%v closet:%v relative:%v energy:%v, len(boundary):%v pcinboundary:%v T:%v",
++					//	idx, p.Idx, fuzzerSnapshot.corpusDistance[idx], fuzzerSnapshot.corpusClosetDistance[idx], seedDistantce, energy, len(proc.fuzzer.boundary), len(pcinboundary), T)
++				} else if !proc.fuzzer.mimicBaseline && proc.fuzzer.enablePCCFG { //no target, only boundary
++					oldp = p.Clone()
++					pcinboundary := make([]uint32, 0)
++					seedsignal := proc.fuzzer.corpusSignals[idx]
++					for seedpc := range seedsignal {
++						if _, ok := proc.fuzzer.boundary[seedpc]; ok {
++							if len(proc.fuzzer.boundary[seedpc]) < 50 { // if a boundary has more than 50 seeds, we treat it as a really hard boundary and skip it
++								pcinboundary = append(pcinboundary, seedpc)
++							}
++						}
++					}
++					energy = int(math.Min(float64(len(pcinboundary)), 5))
++					//gfuzz.GFUZZlog("GFUZZ:onlycfg_choose idx:%v %v energy:%v len(boundary):%v pcinboundary:%v",
++					//	idx, p.Idx, energy, len(proc.fuzzer.boundary), len(pcinboundary))
++				}
++				if energy > 128 {
++					//gfuzz.GFUZZlog("GFUZZ:energy_too_big idx:%v %v energy:%v", idx, p.Idx, energy)
++					energy = 128
++				}
++			}
++			//gfuzz.GFUZZlog("GFUZZ:chooseMutate %v", p.Idx)
++			elapsed_time := time.Since(proc.fuzzer.startTime).Seconds()
++			chance := proc.fuzzer.MutateDirectChance
++			chance -= int(elapsed_time/3600*10)
++			if chance < 0 {
++				chance = 0
++			}
++			p.Mutate(proc.rnd, prog.RecommendedCalls, ct, fuzzerSnapshot.corpus,
++				proc.fuzzer.SyscallSeedsHead, proc.fuzzer.SyscallSeedsTail, chance)
+ 			log.Logf(1, "#%v: mutated", proc.pid)
++			stime := time.Now()
+ 			proc.execute(proc.execOpts, p, ProgNormal, StatFuzz)
++			usedTime += time.Since(stime)
+ 		}
+ 	}
+ }
+ 
+ func (proc *Proc) triageInput(item *WorkTriage) {
+ 	log.Logf(1, "#%v: triaging type=%x", proc.pid, item.flags)
++	len_calls := len(item.p.Calls)
+ 
+ 	prio := signalPrio(item.p, &item.info, item.call)
+-	inputSignal := signal.FromRaw(item.info.Signal, prio)
++	tmpsig := item.info.Signal
++	if proc.fuzzer.mode == "directed" && len(proc.fuzzer.gfuzzfilter)>0{
++		// apply gfuzzfilter only in directed mode
++		beforelen := len(tmpsig)
++		tmpsig = make([]uint32, 0)
++		for _,pc := range item.info.Signal{
++			if ok := proc.fuzzer.gfuzzfilter[pc]; ok {
++				tmpsig = append(tmpsig, pc)
++			}
++		}
++		afterlen := len(tmpsig)
++		gfuzz.GFUZZlog("GFUZZ:gfuzzfilter before:%v after:%v", beforelen, afterlen)
++	}
++	inputSignal := signal.FromRaw(tmpsig, prio)
+ 	newSignal := proc.fuzzer.corpusSignalDiff(inputSignal)
+ 	if newSignal.Empty() {
+ 		return
+@@ -122,6 +482,7 @@ func (proc *Proc) triageInput(item *WorkTriage) {
+ 	)
+ 	// Compute input coverage and non-flaky signal for minimization.
+ 	notexecuted := 0
++	var progSig signal.Signal
+ 	for i := 0; i < signalRuns; i++ {
+ 		info := proc.executeRaw(proc.execOptsCover, item.p, StatTriage)
+ 		if !reexecutionSuccess(info, &item.info, item.call) {
+@@ -142,6 +503,7 @@ func (proc *Proc) triageInput(item *WorkTriage) {
+ 		inputCover.Merge(thisCover)
+ 	}
+ 	if item.flags&ProgMinimized == 0 {
++		gfuzz.Status += "_m"
+ 		item.p, item.call = prog.Minimize(item.p, item.call, false,
+ 			func(p1 *prog.Prog, call1 int) bool {
+ 				for i := 0; i < minimizeAttempts; i++ {
+@@ -156,24 +518,72 @@ func (proc *Proc) triageInput(item *WorkTriage) {
+ 					}
+ 				}
+ 				return false
+-			})
++			}, 60) //only allow minimize in 60s
++	}
++
++	if proc.fuzzer.useprogdis && len_calls > 1 {
++		oldlen := len(inputSignal)
++		info := proc.executeRaw(proc.execOpts, item.p, StatHint)
++		progSig = getProgSignal(item.p, info)
++		//gfuzz.GFUZZlog("GFUZZ:progSig1 len(inputSignal):%v len(progSig):%v not_minimized:%v len(Calls):%v len_calls:%v", len(inputSignal), len(progSig), item.flags&ProgMinimized == 0, len(info.Calls), len_calls)
++		if oldlen != len(progSig) {
++			oldlen = len(progSig)
++			info = proc.executeRaw(proc.execOpts, item.p, StatHint)
++			progSig = progSig.Intersection(getProgSignal(item.p, info))
++			//gfuzz.GFUZZlog("GFUZZ:progSig2 len(inputSignal):%v len(progSig):%v not_minimized:%v len(Calls):%v len_calls:%v", len(inputSignal), len(progSig), item.flags&ProgMinimized == 0, len(info.Calls), len_calls)
++			if oldlen != len(progSig) {
++				info = proc.executeRaw(proc.execOpts, item.p, StatHint)
++				progSig = progSig.Intersection(getProgSignal(item.p, info))
++				//gfuzz.GFUZZlog("GFUZZ:progSig3 len(inputSignal):%v len(progSig):%v not_minimized:%v len(Calls):%v len_calls:%v", len(inputSignal), len(progSig), item.flags&ProgMinimized == 0, len(info.Calls), len_calls)
++			}
++		}
++	} else {
++		progSig = inputSignal
++		//gfuzz.GFUZZlog("GFUZZ:progSig4 direct_use len(inputSignal):%v", len(inputSignal))
+ 	}
+ 
+ 	data := item.p.Serialize()
+ 	sig := hash.Hash(data)
+ 
+ 	log.Logf(2, "added new input for %v to corpus:\n%s", logCallName, data)
++
+ 	proc.fuzzer.sendInputToManager(rpctype.RPCInput{
+-		Call:   callName,
+-		Prog:   data,
+-		Signal: inputSignal.Serialize(),
+-		Cover:  inputCover.Serialize(),
++		Call:    callName,
++		Prog:    data,
++		Signal:  inputSignal.Serialize(),
++		ProgSig: progSig.Serialize(),
++		Cover:   inputCover.Serialize(),
+ 	})
+ 
+-	proc.fuzzer.addInputToCorpus(item.p, inputSignal, sig)
++	proc.fuzzer.addInputToCorpus(item.p, inputSignal, progSig, sig)
++	proc.newseeds++
++	proc.fuzzer.LastNewSeedTime = time.Now()
+ 
+ 	if item.flags&ProgSmashed == 0 {
+-		proc.fuzzer.workQueue.enqueue(&WorkSmash{item.p, item.call})
++		times := 100
++		seedClosestdistance := int64(1000)
++		if proc.fuzzer.enablemoreSmash > 0 {
++			for i := range progSig {
++				d, ok := proc.fuzzer.pc2distance[uint64(i)]
++				if ok {
++					if d < seedClosestdistance {
++						seedClosestdistance = d
++					}
++				}
++			}
++			times = int(float64(proc.fuzzer.enablemoreSmash) * (1- float64(seedClosestdistance)/float64(proc.fuzzer.maxStaticDis)))
++			if times<10{
++				times = 10
++			}
++			//gfuzz.GFUZZlog("GFUZZ:before_enqueue_smash %v shouldsmash:%v times:%v closestdistance:%v queue_len:%v high_queue_len:%v",
++			//	item.p.Idx, item.flags&ProgSmashed == 0, times, seedClosestdistance, len(proc.fuzzer.workQueue.smash), len(proc.fuzzer.workQueue.smashHighPriority))
++		}
++		if seedClosestdistance<10 {
++			proc.fuzzer.workQueue.enqueueHighPriorityWorkSmashQueue(&WorkSmash{item.p, item.call, times, newSignal})
++			//gfuzz.GFUZZlog("GFUZZ:high_priority_queue %v closetdistance:%v", item.p.Idx, seedClosestdistance)
++		} else {
++			proc.fuzzer.workQueue.enqueue(&WorkSmash{item.p, item.call, times, newSignal})
++		}
+ 	}
+ }
+ 
+@@ -200,20 +610,48 @@ func getSignalAndCover(p *prog.Prog, info *ipc.ProgInfo, call int) (signal.Signa
+ 	return signal.FromRaw(inf.Signal, signalPrio(p, inf, call)), inf.Cover
+ }
+ 
++func getProgSignal(p *prog.Prog, info *ipc.ProgInfo) (sig signal.Signal) {
++	inf := &info.Extra
++	sig = signal.FromRaw(inf.Signal, signalPrio(p, inf, -1))
++	for i, inf := range info.Calls {
++		sig.Merge(signal.FromRaw(inf.Signal, signalPrio(p, &inf, i)))
++	}
++	return sig
++}
++
+ func (proc *Proc) smashInput(item *WorkSmash) {
++	startTime := time.Now()
+ 	if proc.fuzzer.faultInjectionEnabled && item.call != -1 {
+ 		proc.failCall(item.p, item.call)
+ 	}
+ 	if proc.fuzzer.comparisonTracingEnabled && item.call != -1 {
+ 		proc.executeHintSeed(item.p, item.call)
+ 	}
++	gfuzz.GFUZZlog("GFUZZ:smashInput %v call:%v times:%v", item.p.Idx, item.call, item.times)
+ 	fuzzerSnapshot := proc.fuzzer.snapshot()
+-	for i := 0; i < 100; i++ {
++	for i := 0; i < item.times; i++ {
++		if time.Since(startTime).Seconds() > 60 {
++			gfuzz.GFUZZlog("GFUZZ:timeout_smash %v i:%v times:%v", item.p.Idx, i, item.times)
++			break
++		}
++		// GFUZZ: we think we should use less time in smash
+ 		p := item.p.Clone()
+-		p.Mutate(proc.rnd, prog.RecommendedCalls, proc.fuzzer.choiceTable, fuzzerSnapshot.corpus)
++		//gfuzz.GFUZZlog("GFUZZ:smashMutate")
++		elapsed_time := time.Since(proc.fuzzer.startTime).Seconds()
++		chance := proc.fuzzer.MutateDirectChance
++		chance -= int(elapsed_time/3600*10)
++		if proc.fuzzer.mode=="directed" && chance < 20 {
++			chance = 20
++		}
++		if chance < 0{
++			chance = 0
++		}
++		p.Mutate(proc.rnd, prog.RecommendedCalls, proc.fuzzer.choiceTable, fuzzerSnapshot.corpus,
++			proc.fuzzer.SyscallSeedsHead, proc.fuzzer.SyscallSeedsTail, chance)
+ 		log.Logf(1, "#%v: smash mutated", proc.pid)
+ 		proc.execute(proc.execOpts, p, ProgNormal, StatSmash)
+ 	}
++	gfuzz.Status = "unknown_aftersmash"
+ }
+ 
+ func (proc *Proc) failCall(p *prog.Prog, call int) {
+@@ -248,6 +686,11 @@ func (proc *Proc) executeHintSeed(p *prog.Prog, call int) {
+ }
+ 
+ func (proc *Proc) execute(execOpts *ipc.ExecOpts, p *prog.Prog, flags ProgTypes, stat Stat) *ipc.ProgInfo {
++	//gfuzz.GFUZZlog("GFUZZ:execute %v status:%v", p.Idx, gfuzz.Status)
++	if p.Idx != "" {
++		proc.fuzzer.seedExectimes[p.Idx]++
++	}
++	proc.exectimes++
+ 	info := proc.executeRaw(execOpts, p, stat)
+ 	if info == nil {
+ 		return nil
+@@ -268,11 +711,18 @@ func (proc *Proc) enqueueCallTriage(p *prog.Prog, flags ProgTypes, callIndex int
+ 	// None of the caller use Cover, so just nil it instead of detaching.
+ 	// Note: triage input uses executeRaw to get coverage.
+ 	info.Cover = nil
++	//proc.triageInput(&WorkTriage{
++	//	p:     p.Clone(),
++	//	call:  callIndex,
++	//	info:  info,
++	//	flags: flags,
++	//})
+ 	proc.fuzzer.workQueue.enqueue(&WorkTriage{
+-		p:     p.Clone(),
+-		call:  callIndex,
+-		info:  info,
+-		flags: flags,
++		p:      p.Clone(),
++		call:   callIndex,
++		info:   info,
++		flags:  flags,
++		status: gfuzz.Status,
+ 	})
+ }
+ 
+diff --git a/syz-fuzzer/workqueue.go b/syz-fuzzer/workqueue.go
+index 62648336c..00fe8f507 100644
+--- a/syz-fuzzer/workqueue.go
++++ b/syz-fuzzer/workqueue.go
+@@ -4,6 +4,7 @@
+ package main
+ 
+ import (
++	"github.com/google/syzkaller/pkg/signal"
+ 	"sync"
+ 
+ 	"github.com/google/syzkaller/pkg/ipc"
+@@ -15,11 +16,18 @@ import (
+ // to triage and send to manager new inputs before we smash programs
+ // in order to not permanently lose interesting programs in case of VM crash.
+ type WorkQueue struct {
+-	mu              sync.RWMutex
+-	triageCandidate []*WorkTriage
+-	candidate       []*WorkCandidate
+-	triage          []*WorkTriage
+-	smash           []*WorkSmash
++	mu                sync.RWMutex
++	triageCandidate   []*WorkTriage
++	candidate         []*WorkCandidate
++	triage            []*WorkTriage
++	smash             []*WorkSmash
++	smashHighPriority []*WorkSmash
++
++	triageCandidateSaved   []*WorkTriage
++	candidateSaved         []*WorkCandidate
++	triageSaved            []*WorkTriage
++	smashSaved             []*WorkSmash
++	smashHighPrioritySaved []*WorkSmash
+ 
+ 	procs          int
+ 	needCandidates chan struct{}
+@@ -39,10 +47,11 @@ const (
+ // During triage we understand if these programs in fact give new coverage,
+ // and if yes, minimize them and add to corpus.
+ type WorkTriage struct {
+-	p     *prog.Prog
+-	call  int
+-	info  ipc.CallInfo
+-	flags ProgTypes
++	p      *prog.Prog
++	call   int
++	info   ipc.CallInfo
++	flags  ProgTypes
++	status string
+ }
+ 
+ // WorkCandidate are programs from hub.
+@@ -57,8 +66,10 @@ type WorkCandidate struct {
+ // During smashing these programs receive a one-time special attention
+ // (emit faults, collect comparison hints, etc).
+ type WorkSmash struct {
+-	p    *prog.Prog
+-	call int
++	p         *prog.Prog
++	call      int
++	times     int
++	newSignal signal.Signal
+ }
+ 
+ func newWorkQueue(procs int, needCandidates chan struct{}) *WorkQueue {
+@@ -87,16 +98,26 @@ func (wq *WorkQueue) enqueue(item interface{}) {
+ 	}
+ }
+ 
++func (wq *WorkQueue) enqueueHighPriorityWorkSmashQueue(item *WorkSmash) {
++	wq.mu.Lock()
++	defer wq.mu.Unlock()
++	wq.smashHighPriority = append(wq.smashHighPriority, item)
++}
++
+ func (wq *WorkQueue) dequeue() (item interface{}) {
+ 	wq.mu.RLock()
+-	if len(wq.triageCandidate)+len(wq.candidate)+len(wq.triage)+len(wq.smash) == 0 {
++	if len(wq.smashHighPriority)+len(wq.triageCandidate)+len(wq.candidate)+len(wq.triage)+len(wq.smash) == 0 {
+ 		wq.mu.RUnlock()
+ 		return nil
+ 	}
+ 	wq.mu.RUnlock()
+ 	wq.mu.Lock()
+ 	wantCandidates := false
+-	if len(wq.triageCandidate) != 0 {
++	if len(wq.smashHighPriority) != 0 {
++		last := len(wq.smashHighPriority) - 1
++		item = wq.smashHighPriority[last]
++		wq.smashHighPriority = wq.smashHighPriority[:last]
++	} else if len(wq.triageCandidate) != 0 {
+ 		last := len(wq.triageCandidate) - 1
+ 		item = wq.triageCandidate[last]
+ 		wq.triageCandidate = wq.triageCandidate[:last]
+@@ -129,3 +150,24 @@ func (wq *WorkQueue) wantCandidates() bool {
+ 	defer wq.mu.RUnlock()
+ 	return len(wq.candidate) < wq.procs
+ }
++
++func (wq *WorkQueue) Stash() (savedLen int, newLen int) {
++	// Stash the workQueue to temporarily clear the pending queue
++	// Use StashPop to recover the saved queue
++	// return (saved queue length, new queue length)
++	wq.mu.Lock()
++	wq.triage, wq.triageSaved = wq.triageSaved, wq.triage
++	wq.triageCandidate, wq.triageCandidateSaved = wq.triageCandidateSaved, wq.triageCandidate
++	wq.candidate, wq.candidateSaved = wq.candidateSaved, wq.candidate
++	wq.smash, wq.smashSaved = wq.smashSaved, wq.smash
++	wq.smashHighPriority, wq.smashHighPrioritySaved = wq.smashHighPrioritySaved, wq.smashHighPriority
++	savedLen = len(wq.smashHighPrioritySaved) + len(wq.triageCandidateSaved) + len(wq.candidateSaved) + len(wq.triageSaved) + len(wq.smashSaved)
++	newLen = len(wq.smashHighPriority) + len(wq.triageCandidate) + len(wq.candidate) + len(wq.triage) + len(wq.smash)
++	wq.mu.Unlock()
++	return
++}
++
++func (wq *WorkQueue) StashPop() (recoveredLen int) {
++	_, recoveredLen = wq.Stash()
++	return
++}
+diff --git a/syz-manager/covfilter.go b/syz-manager/covfilter.go
+index e9c77df55..255f51205 100644
+--- a/syz-manager/covfilter.go
++++ b/syz-manager/covfilter.go
+@@ -143,7 +143,8 @@ func createCoverageBitmap(target *targets.Target, pcs map[uint32]uint32) []byte
+ 	// The file starts with two uint32: covFilterStart and covFilterSize,
+ 	// and a bitmap with size ((covFilterSize>>4) + 7)/8 bytes follow them.
+ 	// 8-bit = 1-byte, additional 1-byte to prevent overflow
+-	data := make([]byte, 8+((size>>4)+7)/8)
++	//	data := make([]byte, 8+((size>>4)+7)/8)
++	data := make([]byte, 8+(size+7)/8)
+ 	order := binary.ByteOrder(binary.BigEndian)
+ 	if target.LittleEndian {
+ 		order = binary.LittleEndian
+@@ -154,7 +155,8 @@ func createCoverageBitmap(target *targets.Target, pcs map[uint32]uint32) []byte
+ 	bitmap := data[8:]
+ 	for pc := range pcs {
+ 		// The lowest 4-bit is dropped.
+-		pc = (pc - start) >> 4
++		//pc = (pc - start) >> 4
++		pc = pc - start
+ 		bitmap[pc/8] |= (1 << (pc % 8))
+ 	}
+ 	return data
+@@ -171,8 +173,8 @@ func coverageFilterRegion(pcs map[uint32]uint32) (uint32, uint32) {
+ 		}
+ 	}
+ 	// align
+-	start &= ^uint32(0xf)
+-	end = (end + 0xf) &^ uint32(0xf)
++	//start &= ^uint32(0xf)
++	//end = (end + 0xf) &^ uint32(0xf)
+ 	return start, end - start
+ }
+ 
+diff --git a/syz-manager/html.go b/syz-manager/html.go
+index c5b3aac33..9fea3f689 100644
+--- a/syz-manager/html.go
++++ b/syz-manager/html.go
+@@ -43,6 +43,7 @@ func (mgr *Manager) initHTTP() {
+ 	http.HandleFunc("/file", mgr.httpFile)
+ 	http.HandleFunc("/report", mgr.httpReport)
+ 	http.HandleFunc("/rawcover", mgr.httpRawCover)
++	http.HandleFunc("/rawcover2", mgr.httpRawCover2)
+ 	http.HandleFunc("/filterpcs", mgr.httpFilterPCs)
+ 	http.HandleFunc("/funccover", mgr.httpFuncCover)
+ 	http.HandleFunc("/filecover", mgr.httpFileCover)
+@@ -452,6 +453,32 @@ func (mgr *Manager) httpRawCover(w http.ResponseWriter, r *http.Request) {
+ 	buf.Flush()
+ }
+ 
++func (mgr *Manager) httpRawCover2(w http.ResponseWriter, r *http.Request) {
++	// Note: initCover is executed without mgr.mu because it takes very long time
++	// (but it only reads config and it protected by initCoverOnce).
++	rg, err := getReportGenerator(mgr.cfg)
++	if err != nil {
++		http.Error(w, err.Error(), http.StatusInternalServerError)
++		return
++	}
++	mgr.mu.Lock()
++	defer mgr.mu.Unlock()
++
++	var cov cover.Cover
++	cov = mgr.serv.corpusCover
++	pcs := coverToPCs(rg, cov.Serialize())
++	sort.Slice(pcs, func(i, j int) bool {
++		return pcs[i] < pcs[j]
++	})
++
++	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
++	buf := bufio.NewWriter(w)
++	for _, pc := range pcs {
++		fmt.Fprintf(buf, "0x%x %d\n", pc, cov[uint32(pc)])
++	}
++	buf.Flush()
++}
++
+ func (mgr *Manager) httpFilterPCs(w http.ResponseWriter, r *http.Request) {
+ 	if mgr.coverFilter == nil {
+ 		fmt.Fprintf(w, "cover is not filtered in config.\n")
+diff --git a/syz-manager/manager.go b/syz-manager/manager.go
+index ca28efdac..3806df8b9 100644
+--- a/syz-manager/manager.go
++++ b/syz-manager/manager.go
+@@ -4,6 +4,7 @@
+ package main
+ 
+ import (
++	"bufio"
+ 	"bytes"
+ 	"encoding/json"
+ 	"flag"
+@@ -53,6 +54,7 @@ type Manager struct {
+ 	crashdir       string
+ 	serv           *RPCServer
+ 	corpusDB       *db.DB
++	oldcorpusDB    *db.DB
+ 	startTime      time.Time
+ 	firstConnect   time.Time
+ 	fuzzingTime    time.Duration
+@@ -121,7 +123,7 @@ func main() {
+ 		log.Fatalf("bad syz-manager build: build with make, run bin/syz-manager")
+ 	}
+ 	flag.Parse()
+-	log.EnableLogCaching(1000, 1<<20)
++	log.EnableLogCaching(10000, 1<<24)
+ 	cfg, err := mgrconfig.LoadFile(*flagConfig)
+ 	if err != nil {
+ 		log.Fatalf("%v", err)
+@@ -193,8 +195,10 @@ func RunManager(cfg *mgrconfig.Config) {
+ 	}
+ 
+ 	go func() {
+-		for lastTime := time.Now(); ; {
+-			time.Sleep(10 * time.Second)
++		lastTime := time.Now()
++		ticker := time.NewTicker(10 * time.Second)
++		defer ticker.Stop()
++		for range ticker.C {
+ 			now := time.Now()
+ 			diff := now.Sub(lastTime)
+ 			lastTime = now
+@@ -215,6 +219,17 @@ func RunManager(cfg *mgrconfig.Config) {
+ 
+ 			log.Logf(0, "VMs %v, executed %v, cover %v, signal %v/%v, crashes %v, repro %v",
+ 				numFuzzing, executed, corpusCover, corpusSignal, maxSignal, crashes, numReproducing)
++			file, err := os.OpenFile("pcs.txt", os.O_CREATE|os.O_WRONLY, 0666)
++			if err == nil {
++				buf := bufio.NewWriter(file)
++				mgr.serv.mu.Lock()
++				for i, j := range mgr.serv.corpusCover {
++					fmt.Fprintf(buf, "0x%x %d\n", i, j)
++				}
++				mgr.serv.mu.Unlock()
++				buf.Flush()
++			}
++			file.Close()
+ 		}
+ 	}()
+ 
+@@ -446,7 +461,12 @@ func (mgr *Manager) preloadCorpus() {
+ 	if err != nil {
+ 		log.Fatalf("failed to open corpus database: %v", err)
+ 	}
++	oldcorpusDB, err := db.Open(filepath.Join(mgr.cfg.Workdir, "corpus_old.db"))
++	if err != nil {
++		log.Fatalf("failed to open old corpus database: %v", err)
++	}
+ 	mgr.corpusDB = corpusDB
++	mgr.oldcorpusDB = oldcorpusDB
+ 
+ 	if seedDir := filepath.Join(mgr.cfg.Syzkaller, "sys", mgr.cfg.TargetOS, "test"); osutil.IsExist(seedDir) {
+ 		seeds, err := ioutil.ReadDir(seedDir)
+@@ -596,10 +616,38 @@ func (mgr *Manager) runInstanceInner(index int, instanceName string) (*report.Re
+ 	if mgr.coverFilterFilename != "" {
+ 		_, err = inst.Copy(mgr.coverFilterFilename)
+ 		if err != nil {
++			log.Fatalf("failed to copy coverage filter bitmap: %v", err)
+ 			return nil, fmt.Errorf("failed to copy coverage filter bitmap: %v", err)
+ 		}
+ 	}
+ 
++	if mgr.cfg.DistanceFile != "" {
++		osutil.CopyFile(mgr.cfg.DistanceFile, filepath.Join(mgr.cfg.Workdir, "distance.json"))
++		_, err = inst.Copy(filepath.Join(mgr.cfg.Workdir, "distance.json"))
++		if err != nil {
++			log.Fatalf("failed to copy distance.json: %v", err)
++			return nil, fmt.Errorf("failed to copy distance.json: %v", err)
++		}
++	}
++
++	if mgr.cfg.PCCFGFile != "" {
++		osutil.CopyFile(mgr.cfg.PCCFGFile, filepath.Join(mgr.cfg.Workdir, "cfg.json"))
++		_, err = inst.Copy(filepath.Join(mgr.cfg.Workdir, "cfg.json"))
++		if err != nil {
++			log.Fatalf("failed to copy cfg.json: %v", err)
++			return nil, fmt.Errorf("failed to copy cfg.json: %v", err)
++		}
++	}
++
++	if mgr.cfg.GFuzzFilter != ""{
++		osutil.CopyFile(mgr.cfg.GFuzzFilter, filepath.Join(mgr.cfg.Workdir, "gfuzzfilter.json"))
++		_, err = inst.Copy(filepath.Join(mgr.cfg.Workdir, "gfuzzfilter.json"))
++		if err != nil {
++			log.Fatalf("failed to copy gfuzzfilter.json: %v", err)
++			return nil, fmt.Errorf("failed to copy gfuzzfilter.json: %v", err)
++		}
++	}
++
+ 	fuzzerBin, err := inst.Copy(mgr.cfg.FuzzerBin)
+ 	if err != nil {
+ 		return nil, fmt.Errorf("failed to copy binary: %v", err)
+@@ -740,6 +788,7 @@ func (mgr *Manager) saveCrash(crash *Crash) bool {
+ 			oldestI = i
+ 			if i == 0 {
+ 				go mgr.emailCrash(crash)
++				osutil.WriteFile(filepath.Join(dir, "foundtime"), []byte(fmt.Sprintf("%v", time.Since(mgr.startTime).Seconds())))
+ 			}
+ 			break
+ 		}
+@@ -1010,14 +1059,16 @@ func (mgr *Manager) minimizeCorpus() {
+ 	if mgr.phase < phaseTriagedCorpus {
+ 		return
+ 	}
+-	for key := range mgr.corpusDB.Records {
++	for key, rec := range mgr.corpusDB.Records {
+ 		_, ok1 := mgr.corpus[key]
+ 		_, ok2 := mgr.disabledHashes[key]
+ 		if !ok1 && !ok2 {
++			mgr.oldcorpusDB.Save(key, rec.Val, rec.Seq)
+ 			mgr.corpusDB.Delete(key)
+ 		}
+ 	}
+ 	mgr.corpusDB.BumpVersion(currentDBVersion)
++	mgr.oldcorpusDB.Flush()
+ }
+ 
+ type CallCov struct {
+@@ -1132,11 +1183,21 @@ func (mgr *Manager) candidateBatch(size int) []rpctype.RPCCandidate {
+ }
+ 
+ func (mgr *Manager) rotateCorpus() bool {
++	if mgr.cfg.DisableRotate {
++		return false
++	}
+ 	mgr.mu.Lock()
+ 	defer mgr.mu.Unlock()
+ 	return mgr.phase == phaseTriagedHub
+ }
+ 
++func (mgr *Manager) rotateChooseSyscall() bool {
++	if mgr.cfg.DisableRotateChooseSyscall {
++		return false
++	}
++	return true
++}
++
+ func (mgr *Manager) collectUsedFiles() {
+ 	if mgr.vmPool == nil {
+ 		return
+diff --git a/syz-manager/rpc.go b/syz-manager/rpc.go
+index 72173aae6..3c957f06b 100644
+--- a/syz-manager/rpc.go
++++ b/syz-manager/rpc.go
+@@ -4,9 +4,14 @@
+ package main
+ 
+ import (
++	"bufio"
++	"encoding/json"
+ 	"fmt"
+ 	"math/rand"
+ 	"net"
++	"os"
++	"strconv"
++	"strings"
+ 	"sync"
+ 	"time"
+ 
+@@ -27,15 +32,19 @@ type RPCServer struct {
+ 	stats                 *Stats
+ 	batchSize             int
+ 
+-	mu            sync.Mutex
+-	fuzzers       map[string]*Fuzzer
+-	checkResult   *rpctype.CheckArgs
+-	maxSignal     signal.Signal
+-	corpusSignal  signal.Signal
+-	corpusCover   cover.Cover
+-	rotator       *prog.Rotator
+-	rnd           *rand.Rand
+-	checkFailures int
++	mu              sync.Mutex
++	fuzzers         map[string]*Fuzzer
++	checkResult     *rpctype.CheckArgs
++	maxSignal       signal.Signal
++	corpusSignal    signal.Signal
++	corpusCover     cover.Cover
++	rotator         *prog.Rotator
++	rnd             *rand.Rand
++	checkFailures   int
++	startTime       time.Time
++	StageStartTime  time.Time
++	LastNewSeedTime time.Time
++	Mode            string
+ }
+ 
+ type Fuzzer struct {
+@@ -58,16 +67,21 @@ type RPCManagerView interface {
+ 	newInput(inp rpctype.RPCInput, sign signal.Signal) bool
+ 	candidateBatch(size int) []rpctype.RPCCandidate
+ 	rotateCorpus() bool
++	rotateChooseSyscall() bool
+ }
+ 
+ func startRPCServer(mgr *Manager) (*RPCServer, error) {
+ 	serv := &RPCServer{
+-		mgr:         mgr,
+-		cfg:         mgr.cfg,
+-		coverFilter: mgr.coverFilter,
+-		stats:       mgr.stats,
+-		fuzzers:     make(map[string]*Fuzzer),
+-		rnd:         rand.New(rand.NewSource(time.Now().UnixNano())),
++		mgr:             mgr,
++		cfg:             mgr.cfg,
++		coverFilter:     mgr.coverFilter,
++		stats:           mgr.stats,
++		fuzzers:         make(map[string]*Fuzzer),
++		rnd:             rand.New(rand.NewSource(time.Now().UnixNano())),
++		startTime:       mgr.startTime,
++		StageStartTime:  time.Now(),
++		LastNewSeedTime: time.Now(),
++		Mode:            "init",
+ 	}
+ 	serv.batchSize = 5
+ 	if serv.batchSize < mgr.cfg.Procs {
+@@ -103,6 +117,42 @@ func (serv *RPCServer) Connect(a *rpctype.ConnectArgs, r *rpctype.ConnectRes) er
+ 	r.GitRevision = prog.GitRevision
+ 	r.TargetRevision = serv.cfg.Target.Revision
+ 	r.EnabledCoverFilter = enabledCoverFilter
++	r.EnableRandomChoose = serv.cfg.EnableRandomChoose
++	r.EnableGlobalDistance = serv.cfg.EnableGlobalDistance
++	r.EnableSeedExecLimit = serv.cfg.EnableSeedExecLimit
++	r.CoolingTx = serv.cfg.CoolingTx
++	r.StartTime = serv.startTime
++	r.StageStartTime = serv.StageStartTime
++	r.LastNewSeedTime = serv.LastNewSeedTime
++	r.Mode = serv.Mode
++	r.EnablemoreSmash = serv.cfg.EnablemoreSmash
++	r.UseClosetDistance = serv.cfg.UseClosetDistance
++	r.NoLog = serv.cfg.NoLog
++	r.DirectchooseEntertime = serv.cfg.DirectchooseEntertime
++	r.DirectchooseForceEntertime = serv.cfg.DirectchooseForceEntertime
++	r.DirectchooseExittime = serv.cfg.DirectchooseExittime
++	r.DirectchooseForceExittime = serv.cfg.DirectchooseForceExittime
++	r.MimicBaseline = serv.cfg.MimicBaseline
++	r.UseProgDis = serv.cfg.UseProgDis
++	r.SyscallSeeds = serv.cfg.SyscallSeeds
++	r.MutateDirectChance = serv.cfg.MutateDirectChance
++	r.EnableOrderInfer = serv.cfg.EnableOrderInfer
++	RuleCallsStr, _ := json.Marshal(serv.cfg.RuleCalls)
++	r.RuleCallsStr = string(RuleCallsStr)
++	hextoint := func(s string) uint32 {
++		kk := strings.Replace(s, "0x", "", -1)
++		kint, err := strconv.ParseUint(kk, 16, 32)
++		if err != nil {
++			panic(err)
++		}
++		return uint32(kint)
++	}
++	r.TargetPC = make([]uint32, 0)
++	for _, targetpc := range serv.cfg.TargetPC {
++		if targetpc != "" {
++			r.TargetPC = append(r.TargetPC, hextoint(targetpc))
++		}
++	}
+ 	if serv.mgr.rotateCorpus() && serv.rnd.Intn(5) == 0 {
+ 		// We do rotation every other time because there are no objective
+ 		// proofs regarding its efficiency either way.
+@@ -146,7 +196,13 @@ func (serv *RPCServer) rotateCorpus(f *Fuzzer, corpus []rpctype.RPCInput) *rpcty
+ 	//
+ 	// Note: at no point we drop anything globally and permanently.
+ 	// Everything we remove during this process is temporal and specific to a single VM.
+-	calls := serv.rotator.Select()
++	var calls map[*prog.Syscall]bool
++
++	if serv.mgr.rotateChooseSyscall() {
++		calls = serv.rotator.Select()
++	}else{
++		calls = serv.targetEnabledSyscalls
++	}
+ 
+ 	var callIDs []int
+ 	callNames := make(map[string]bool)
+@@ -223,6 +279,7 @@ func (serv *RPCServer) Check(a *rpctype.CheckArgs, r *int) error {
+ 	}
+ 	serv.targetEnabledSyscalls = make(map[*prog.Syscall]bool)
+ 	for _, call := range a.EnabledCalls[serv.cfg.Sandbox] {
++		//fmt.Printf("EnabledSyscall %d %v %v %d\n", call, serv.cfg.Target.Syscalls[call].Name, serv.cfg.Target.Syscalls[call].CallName, serv.cfg.Target.Syscalls[call].NR)
+ 		serv.targetEnabledSyscalls[serv.cfg.Target.Syscalls[call]] = true
+ 	}
+ 	log.Logf(0, "machine check:")
+@@ -234,6 +291,36 @@ func (serv *RPCServer) Check(a *rpctype.CheckArgs, r *int) error {
+ 	a.DisabledCalls = nil
+ 	serv.checkResult = a
+ 	serv.rotator = prog.MakeRotator(serv.cfg.Target, serv.targetEnabledSyscalls, serv.rnd)
++	serv.startTime = time.Now()
++	return nil
++}
++
++func (serv *RPCServer) StageExit(fuzzerName string, r *int) error {
++	serv.StageStartTime = time.Now()
++	serv.LastNewSeedTime = time.Now()
++	return nil
++}
++
++func (serv *RPCServer) ChangeMode(a *rpctype.ModeChange, r *int) error{
++	serv.Mode = a.Mode // todo: support multi fuzzers
++	log.Logf(0, "changeMode %v %v", a.Name, a.Mode)
++	return nil
++}
++
++func (serv *RPCServer) TargetFound(targetpc string, r *int) error {
++	filename := fmt.Sprintf("foundtime_%s.txt", targetpc)
++	if _, err := os.Stat(filename); !os.IsNotExist(err) {
++		// already wrote, not first found, just ignore
++		return nil
++	}
++	fmt.Printf("[TargetFound] %s %.2f", targetpc, time.Since(serv.startTime).Seconds())
++	file, err := os.OpenFile(filename, os.O_CREATE|os.O_WRONLY, 0666)
++	if err == nil {
++		buf := bufio.NewWriter(file)
++		fmt.Fprintf(buf, "%.2f\n", time.Since(serv.startTime).Seconds())
++		buf.Flush()
++	}
++	file.Close()
+ 	return nil
+ }
+ 
+@@ -284,6 +371,7 @@ func (serv *RPCServer) NewInput(a *rpctype.NewInputArgs, r *int) error {
+ 		serv.stats.corpusCoverFiltered.add(filtered)
+ 	}
+ 	serv.stats.newInputs.inc()
++	serv.LastNewSeedTime = time.Now()
+ 	if rotated {
+ 		serv.stats.rotatedInputs.inc()
+ 	}
+diff --git a/tools/syz-db/syz-db.go b/tools/syz-db/syz-db.go
+index 0b48e7c6d..652ddbe76 100644
+--- a/tools/syz-db/syz-db.go
++++ b/tools/syz-db/syz-db.go
+@@ -120,7 +120,17 @@ func unpack(file, dir string) {
+ 		tool.Failf("failed to open database: %v", err)
+ 	}
+ 	osutil.MkdirAll(dir)
++	target, err := prog.GetTarget("linux", "amd64")
++	if err != nil {
++		panic(err)
++	}
+ 	for key, rec := range db.Records {
++		p, err := target.Deserialize(rec.Val, prog.NonStrict)
++		if err != nil {
++			panic(err)
++		}
++		sig := hash.Hash(p.Serialize())
++		key = sig.String()
+ 		fname := filepath.Join(dir, key)
+ 		if rec.Seq != 0 {
+ 			fname += fmt.Sprintf("-%v", rec.Seq)
+diff --git a/tools/syz-execprog/execprog.go b/tools/syz-execprog/execprog.go
+index dc6b1a22c..4f4a9ee74 100644
+--- a/tools/syz-execprog/execprog.go
++++ b/tools/syz-execprog/execprog.go
+@@ -139,6 +139,7 @@ func (ctx *Context) run(pid int) {
+ 			return
+ 		}
+ 		entry := ctx.entries[idx%len(ctx.entries)]
++		fmt.Printf("%s\n", entry.P.Serialize())
+ 		ctx.execute(pid, env, entry)
+ 	}
+ }
+@@ -254,7 +255,7 @@ func (ctx *Context) dumpCallCoverage(coverFile string, info *ipc.CallInfo) {
+ 	}
+ 	buf := new(bytes.Buffer)
+ 	for _, pc := range info.Cover {
+-		fmt.Fprintf(buf, "0x%x\n", cover.RestorePC(pc, 0xffffffff))
++		fmt.Fprintf(buf, "0x%x\n", cover.RestorePC(pc, 0))
+ 	}
+ 	err := osutil.WriteFile(coverFile, buf.Bytes())
+ 	if err != nil {
+diff --git a/tools/syz-mutate/mutate.go b/tools/syz-mutate/mutate.go
+index b6b43f48f..34218d2af 100644
+--- a/tools/syz-mutate/mutate.go
++++ b/tools/syz-mutate/mutate.go
+@@ -79,7 +79,7 @@ func main() {
+ 			fmt.Fprintf(os.Stderr, "failed to deserialize the program: %v\n", err)
+ 			os.Exit(1)
+ 		}
+-		p.Mutate(rs, *flagLen, ct, corpus)
++		p.Mutate(rs, *flagLen, ct, corpus, nil, nil, 0)
+ 	}
+ 	fmt.Printf("%s\n", p.Serialize())
+ }
+diff --git a/tools/syz-showprio/genprog.go b/tools/syz-showprio/genprog.go
+new file mode 100644
+index 000000000..1897f6ec1
+--- /dev/null
++++ b/tools/syz-showprio/genprog.go
+@@ -0,0 +1,42 @@
++// Copyright 2019 syzkaller project authors. All rights reserved.
++// Use of this source code is governed by Apache 2 LICENSE that can be found in the LICENSE file.
++
++package main
++
++import (
++	"fmt"
++	"time"
++	"math/rand"
++	//"encoding/json"
++	"os"
++	//"io/ioutil"
++	
++	"github.com/google/syzkaller/gfuzz"
++
++	. "github.com/google/syzkaller/prog"
++	_ "github.com/google/syzkaller/pkg/mgrconfig"
++)
++
++func main() {
++	target, err := GetTarget("linux", "amd64")
++	if err != nil {
++		fmt.Fprintf(os.Stderr, "%v\n", err)
++		os.Exit(1)
++	}
++	rnd := rand.New(rand.NewSource(time.Now().UnixNano()))
++	ct := target.BuildChoiceTable(nil, nil)
++	syscallid := -1
++	for idx, syscall := range target.Syscalls {
++	    if syscall.Name == os.Args[1]{
++	    	fmt.Printf("%v %v %v\n", idx, syscall.Name, syscall)
++	    	syscallid = syscall.ID
++	    }
++	}
++	gfuzz.UseRuleCall = nil
++	if syscallid != -1{
++	    for i:=0; i<10000; i++{
++	        fmt.Printf("[%d] %s", i, target.GeneratebySyscall(rnd, RecommendedCalls, ct, append(make([]int, 0), syscallid)).Serialize())
++	    }
++	}
++
++}
+\ No newline at end of file
+diff --git a/tools/syz-stress/stress.go b/tools/syz-stress/stress.go
+index 21926fe89..f7c77e643 100644
+--- a/tools/syz-stress/stress.go
++++ b/tools/syz-stress/stress.go
+@@ -98,13 +98,13 @@ func main() {
+ 				if *flagGenerate && len(corpus) == 0 || i%4 != 0 {
+ 					p = target.Generate(rs, prog.RecommendedCalls, ct)
+ 					execute(pid, env, execOpts, p)
+-					p.Mutate(rs, prog.RecommendedCalls, ct, corpus)
++					p.Mutate(rs, prog.RecommendedCalls, ct, corpus, nil, nil, 0)
+ 					execute(pid, env, execOpts, p)
+ 				} else {
+ 					p = corpus[rnd.Intn(len(corpus))].Clone()
+-					p.Mutate(rs, prog.RecommendedCalls, ct, corpus)
++					p.Mutate(rs, prog.RecommendedCalls, ct, corpus, nil, nil, 0)
+ 					execute(pid, env, execOpts, p)
+-					p.Mutate(rs, prog.RecommendedCalls, ct, corpus)
++					p.Mutate(rs, prog.RecommendedCalls, ct, corpus, nil, nil, 0)
+ 					execute(pid, env, execOpts, p)
+ 				}
+ 			}
+diff --git a/vm/gvisor/gvisor.go b/vm/gvisor/gvisor.go
+index 4365c22f9..e1728df24 100644
+--- a/vm/gvisor/gvisor.go
++++ b/vm/gvisor/gvisor.go
+@@ -82,6 +82,7 @@ func (pool *Pool) Create(workdir string, index int) (vmimpl.Instance, error) {
+ 	rootDir := filepath.Clean(filepath.Join(workdir, "..", "gvisor_root"))
+ 	imageDir := filepath.Join(workdir, "image")
+ 	bundleDir := filepath.Join(workdir, "bundle")
++	os.RemoveAll(rootDir)
+ 	osutil.MkdirAll(rootDir)
+ 	osutil.MkdirAll(bundleDir)
+ 	osutil.MkdirAll(imageDir)
+@@ -93,7 +94,7 @@ func (pool *Pool) Create(workdir string, index int) (vmimpl.Instance, error) {
+ 		}
+ 		caps += "\"" + c + "\""
+ 	}
+-	vmConfig := fmt.Sprintf(configTempl, imageDir, caps)
++	vmConfig := fmt.Sprintf(configTempl, imageDir, caps, filepath.Clean(filepath.Join(workdir, "..")), index)
+ 	if err := osutil.WriteFile(filepath.Join(bundleDir, "config.json"), []byte(vmConfig)); err != nil {
+ 		return nil, err
+ 	}
+@@ -380,22 +381,41 @@ const initStartMsg = "SYZKALLER INIT STARTED\n"
+ 
+ const configTempl = `
+ {
+-	"root": {
+-		"path": "%[1]v",
+-		"readonly": true
+-	},
+-	"process":{
+-                "args": ["/init"],
+-                "cwd": "/tmp",
+-                "env": ["SYZ_GVISOR_PROXY=1"],
+-                "capabilities": {
+-                	"bounding": [%[2]v],
+-                	"effective": [%[2]v],
+-                	"inheritable": [%[2]v],
+-                	"permitted": [%[2]v],
+-                	"ambient": [%[2]v]
+-                }
+-	}
++    "root": {
++        "path": "%[1]v",
++        "readonly": false
++    },
++    "mounts": [{
++        "destination": "/workdir",
++        "type": "bind",
++        "source": "%[3]v",
++        "options": ["rbind", "rprivate"]
++    }],
++    "process":{
++        "args": ["/init"],
++        "cwd": "/tmp",
++        "env": ["SYZ_GVISOR_PROXY=1", "INDEX=%[4]v"],
++        "capabilities": {
++            "bounding": [%[2]v],
++            "effective": [%[2]v],
++            "inheritable": [%[2]v],
++            "permitted": [%[2]v],
++            "ambient": [%[2]v]
++        }
++    },
++    "linux": {
++      "resources": {
++          "memory": {
++            "limit": 4294967296,
++            "disableOOMKiller": false
++          },
++          "cpu": {
++            "shares": 0,
++            "quota": 100000,
++            "period": 100000
++          }
++      }
++    }
+ }
+ `
+ 
+-- 
+2.17.1
+
