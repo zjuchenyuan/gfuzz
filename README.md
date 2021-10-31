@@ -19,7 +19,7 @@ docker build -t zjuchenyuan/gollvm -f dockerfiles/Dockerfile.gollvm
 
 This will build and install gollvm version `d30fc0bf` in the image `zjuchenyuan/gollvm`.
 
-### 2. Build target gVisor to LLVM IR
+### 2. Build target gVisor to LLVM IR, and get global CFG
 
 Here we take gVisor version `release-20210125.0` as an example.
 
@@ -47,4 +47,23 @@ docker cp tmp:/g/gvisor_bin /g/
 ```
 
 ### 3. Distance calculation, syscall inference and so on...
+
+We take general experiment setting as an example, to show you how to generate conf files for fuzzing.
+
+24 targets in version `release-20210125.0` are involved in the general experiment, and the corresponding pc list is given in the [data.py](./fuzz_experiments/general/data.py).
+
+```
+cd /g/fuzz_experiments/general
+python3 data.py
+```
+
+This will conduct several analysis towards the target, and generate these files:
+
+- \*\_bbdis.json: bb level distance of each reachable pc
+- \*\_cgdis.json: function level distance of each reachable pc
+- \*\_aflgodis.json: use aflgo distance calculation method to estimate the distance
+- \*\_syscalls.json: inferred syscalls for the target
+
+> If you want to check the pc meaning, try this:
+>     python3 /g/scripts/static/showpc.py release-20210125.0 0x4dd0000
 
