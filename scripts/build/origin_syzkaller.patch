@@ -1,0 +1,408 @@
+From b75b7d2a0569a5424b430985b1aab9b220a6fdf9 Mon Sep 17 00:00:00 2001
+From: Yuwei Li <liyuwei@zju.edu.cn>
+Date: Mon, 1 Nov 2021 23:13:13 +0800
+Subject: [PATCH] [gfuzz] patch origin_syzkaller
+
+---
+ pkg/cover/cover.go      | 12 ++++++---
+ pkg/mgrconfig/config.go |  3 +++
+ pkg/rpctype/rpctype.go  |  1 +
+ pkg/signal/signal.go    | 24 ++++++++----------
+ syz-fuzzer/fuzzer.go    | 24 ++++++++++++++++++
+ syz-manager/manager.go  | 19 +++++++++++++--
+ syz-manager/rpc.go      | 40 ++++++++++++++++++++++++++++++
+ vm/gvisor/gvisor.go     | 54 ++++++++++++++++++++++++++++-------------
+ 8 files changed, 141 insertions(+), 36 deletions(-)
+
+diff --git a/pkg/cover/cover.go b/pkg/cover/cover.go
+index 572d5e5da..6cdb78670 100644
+--- a/pkg/cover/cover.go
++++ b/pkg/cover/cover.go
+@@ -4,7 +4,10 @@
+ // Package cover provides types for working with coverage information (arrays of covered PCs).
+ package cover
+ 
+-type Cover map[uint32]struct{}
++import "time"
++
++//type Cover map[uint32]struct{}
++type Cover map[uint32]int64
+ 
+ type Subsystem struct {
+ 	Name  string   `json:"name"`
+@@ -18,7 +21,10 @@ func (cov *Cover) Merge(raw []uint32) {
+ 		*cov = c
+ 	}
+ 	for _, pc := range raw {
+-		c[pc] = struct{}{}
++		if _, ok := c[pc]; ok {
++			continue
++		}
++		c[pc] = time.Now().Unix()
+ 	}
+ }
+ 
+@@ -34,7 +40,7 @@ func (cov *Cover) MergeDiff(raw []uint32) []uint32 {
+ 		if _, ok := c[pc]; ok {
+ 			continue
+ 		}
+-		c[pc] = struct{}{}
++		c[pc] = time.Now().Unix()
+ 		raw[n] = pc
+ 		n++
+ 	}
+diff --git a/pkg/mgrconfig/config.go b/pkg/mgrconfig/config.go
+index e4bfc46f8..74fd81da8 100644
+--- a/pkg/mgrconfig/config.go
++++ b/pkg/mgrconfig/config.go
+@@ -149,6 +149,9 @@ type Config struct {
+ 	// VM-type-specific parameters.
+ 	// Parameters for concrete types are in Config type in vm/TYPE/TYPE.go, e.g. vm/qemu/qemu.go.
+ 	VM json.RawMessage `json:"vm"`
++	
++	//target pc, this is used to write foundtime.txt
++	TargetPC []string `json:"targetpc,omitempty"`
+ 
+ 	// Implementation details beyond this point. Filled after parsing.
+ 	Derived `json:"-"`
+diff --git a/pkg/rpctype/rpctype.go b/pkg/rpctype/rpctype.go
+index c87334cd5..381cc89ff 100644
+--- a/pkg/rpctype/rpctype.go
++++ b/pkg/rpctype/rpctype.go
+@@ -38,6 +38,7 @@ type ConnectRes struct {
+ 	MemoryLeakFrames   []string
+ 	DataRaceFrames     []string
+ 	EnabledCoverFilter bool
++	TargetPC           []uint32
+ }
+ 
+ type CheckArgs struct {
+diff --git a/pkg/signal/signal.go b/pkg/signal/signal.go
+index d6fa8d459..b3b0d76ad 100644
+--- a/pkg/signal/signal.go
++++ b/pkg/signal/signal.go
+@@ -4,16 +4,12 @@
+ // Package signal provides types for working with feedback signal.
+ package signal
+ 
+-type (
+-	elemType uint32
+-	prioType int8
+-)
+ 
+-type Signal map[elemType]prioType
++type Signal map[uint32]int8
+ 
+ type Serial struct {
+-	Elems []elemType
+-	Prios []prioType
++	Elems []uint32
++	Prios []int8
+ }
+ 
+ func (s Signal) Len() int {
+@@ -57,7 +53,7 @@ func FromRaw(raw []uint32, prio uint8) Signal {
+ 	}
+ 	s := make(Signal, len(raw))
+ 	for _, e := range raw {
+-		s[elemType(e)] = prioType(prio)
++		s[uint32(e)] = int8(prio)
+ 	}
+ 	return s
+ }
+@@ -67,8 +63,8 @@ func (s Signal) Serialize() Serial {
+ 		return Serial{}
+ 	}
+ 	res := Serial{
+-		Elems: make([]elemType, len(s)),
+-		Prios: make([]prioType, len(s)),
++		Elems: make([]uint32, len(s)),
++		Prios: make([]int8, len(s)),
+ 	}
+ 	i := 0
+ 	for e, p := range s {
+@@ -113,13 +109,13 @@ func (s Signal) Diff(s1 Signal) Signal {
+ func (s Signal) DiffRaw(raw []uint32, prio uint8) Signal {
+ 	var res Signal
+ 	for _, e := range raw {
+-		if p, ok := s[elemType(e)]; ok && p >= prioType(prio) {
++		if p, ok := s[uint32(e)]; ok && p >= int8(prio) {
+ 			continue
+ 		}
+ 		if res == nil {
+ 			res = make(Signal)
+ 		}
+-		res[elemType(e)] = prioType(prio)
++		res[uint32(e)] = int8(prio)
+ 	}
+ 	return res
+ }
+@@ -160,10 +156,10 @@ type Context struct {
+ 
+ func Minimize(corpus []Context) []interface{} {
+ 	type ContextPrio struct {
+-		prio prioType
++		prio int8
+ 		idx  int
+ 	}
+-	covered := make(map[elemType]ContextPrio)
++	covered := make(map[uint32]ContextPrio)
+ 	for i, inp := range corpus {
+ 		for e, p := range inp.Signal {
+ 			if prev, ok := covered[e]; !ok || p > prev.prio {
+diff --git a/syz-fuzzer/fuzzer.go b/syz-fuzzer/fuzzer.go
+index 98fbecd8e..5db72485c 100644
+--- a/syz-fuzzer/fuzzer.go
++++ b/syz-fuzzer/fuzzer.go
+@@ -61,6 +61,8 @@ type Fuzzer struct {
+ 	newSignal    signal.Signal // diff of maxSignal since last sync with master
+ 
+ 	logMu sync.Mutex
++	
++	targetpc      []uint32
+ }
+ 
+ type FuzzerSnapshot struct {
+@@ -269,6 +271,8 @@ func main() {
+ 	if r.EnabledCoverFilter {
+ 		fuzzer.execOpts.Flags |= ipc.FlagEnableCoverageFilter
+ 	}
++	
++	fuzzer.targetpc = r.TargetPC
+ 
+ 	log.Logf(0, "starting %v fuzzer processes", *flagProcs)
+ 	for pid := 0; pid < *flagProcs; pid++ {
+@@ -456,8 +460,28 @@ func (fuzzer *FuzzerSnapshot) chooseProgram(r *rand.Rand) *prog.Prog {
+ 	return fuzzer.corpus[idx]
+ }
+ 
++var TargetFound = make(map[uint32]bool)
++func (fuzzer *Fuzzer) notifyTargetFound(targetpc uint32){
++	if _, ok := TargetFound[targetpc]; ok{
++		return
++	}
++	a := fmt.Sprintf("%x", targetpc)
++	if err := fuzzer.manager.Call("Manager.TargetFound", a, nil); err != nil {
++		log.Logf(0, "Manager.TargetFound call failed: %v", err)
++	}else{
++		TargetFound[targetpc] = true
++	}
++}
++
++
+ func (fuzzer *Fuzzer) addInputToCorpus(p *prog.Prog, sign signal.Signal, sig hash.Sig) {
+ 	fuzzer.corpusMu.Lock()
++	for _,targetpc := range fuzzer.targetpc {
++		if _, ok := sign[targetpc]; ok {
++			fuzzer.notifyTargetFound(targetpc)
++		}
++	}
++
+ 	if _, ok := fuzzer.corpusHashes[sig]; !ok {
+ 		fuzzer.corpus = append(fuzzer.corpus, p)
+ 		fuzzer.corpusHashes[sig] = struct{}{}
+diff --git a/syz-manager/manager.go b/syz-manager/manager.go
+index ca28efdac..a3a00d97c 100644
+--- a/syz-manager/manager.go
++++ b/syz-manager/manager.go
+@@ -4,6 +4,7 @@
+ package main
+ 
+ import (
++	"bufio"
+ 	"bytes"
+ 	"encoding/json"
+ 	"flag"
+@@ -193,8 +194,10 @@ func RunManager(cfg *mgrconfig.Config) {
+ 	}
+ 
+ 	go func() {
+-		for lastTime := time.Now(); ; {
+-			time.Sleep(10 * time.Second)
++		lastTime := time.Now()
++		ticker := time.NewTicker(10 * time.Second)
++		defer ticker.Stop()
++		for range ticker.C {
+ 			now := time.Now()
+ 			diff := now.Sub(lastTime)
+ 			lastTime = now
+@@ -215,6 +218,18 @@ func RunManager(cfg *mgrconfig.Config) {
+ 
+ 			log.Logf(0, "VMs %v, executed %v, cover %v, signal %v/%v, crashes %v, repro %v",
+ 				numFuzzing, executed, corpusCover, corpusSignal, maxSignal, crashes, numReproducing)
++			file, err := os.OpenFile("pcs.txt", os.O_CREATE | os.O_WRONLY, 0666)
++			if err == nil{
++				buf := bufio.NewWriter(file)
++				mgr.serv.mu.Lock()
++				for i, j := range mgr.serv.corpusCover{
++					fmt.Fprintf(buf, "0x%x %d\n", i, j)
++				}
++				mgr.serv.mu.Unlock()
++				buf.Flush()
++				//log.Logf(0, "Write pcs.txt success")
++			}
++			file.Close()
+ 		}
+ 	}()
+ 
+diff --git a/syz-manager/rpc.go b/syz-manager/rpc.go
+index 72173aae6..2b9db7238 100644
+--- a/syz-manager/rpc.go
++++ b/syz-manager/rpc.go
+@@ -7,6 +7,10 @@ import (
+ 	"fmt"
+ 	"math/rand"
+ 	"net"
++	"strconv"
++	"strings"
++	"os"
++	"bufio"
+ 	"sync"
+ 	"time"
+ 
+@@ -35,6 +39,8 @@ type RPCServer struct {
+ 	corpusCover   cover.Cover
+ 	rotator       *prog.Rotator
+ 	rnd           *rand.Rand
++	
++	startTime     time.Time
+ 	checkFailures int
+ }
+ 
+@@ -68,6 +74,7 @@ func startRPCServer(mgr *Manager) (*RPCServer, error) {
+ 		stats:       mgr.stats,
+ 		fuzzers:     make(map[string]*Fuzzer),
+ 		rnd:         rand.New(rand.NewSource(time.Now().UnixNano())),
++		startTime:   mgr.startTime,
+ 	}
+ 	serv.batchSize = 5
+ 	if serv.batchSize < mgr.cfg.Procs {
+@@ -103,6 +110,21 @@ func (serv *RPCServer) Connect(a *rpctype.ConnectArgs, r *rpctype.ConnectRes) er
+ 	r.GitRevision = prog.GitRevision
+ 	r.TargetRevision = serv.cfg.Target.Revision
+ 	r.EnabledCoverFilter = enabledCoverFilter
++	hextoint := func(s string) uint32{
++		kk := strings.Replace(s, "0x", "", -1)
++		kint, err := strconv.ParseUint(kk, 16, 32)
++		if err != nil {
++			panic(err)
++		}
++		return uint32(kint)
++	}
++	r.TargetPC = make([]uint32, 0)
++	for _,targetpc := range serv.cfg.TargetPC {
++		if targetpc != "" {
++			r.TargetPC = append(r.TargetPC, hextoint(targetpc))
++		}
++	}
++
+ 	if serv.mgr.rotateCorpus() && serv.rnd.Intn(5) == 0 {
+ 		// We do rotation every other time because there are no objective
+ 		// proofs regarding its efficiency either way.
+@@ -237,6 +259,24 @@ func (serv *RPCServer) Check(a *rpctype.CheckArgs, r *int) error {
+ 	return nil
+ }
+ 
++func (serv *RPCServer) TargetFound(targetpc string, r *int) error {
++	filename := fmt.Sprintf("foundtime_%s.txt", targetpc)
++	if _, err := os.Stat(filename); !os.IsNotExist(err) {
++		// already wrote, not first found, just ignore
++		return nil
++	}
++	fmt.Printf("[TargetFound] %s %.2f", targetpc, time.Since(serv.startTime).Seconds())
++	file, err := os.OpenFile(filename, os.O_CREATE | os.O_WRONLY, 0666)
++	if err == nil{
++		buf := bufio.NewWriter(file)
++		fmt.Fprintf(buf, "%.2f\n", time.Since(serv.startTime).Seconds())
++		buf.Flush()
++	}
++	file.Close()
++	return nil
++}
++
++
+ func (serv *RPCServer) NewInput(a *rpctype.NewInputArgs, r *int) error {
+ 	inputSignal := a.Signal.Deserialize()
+ 	log.Logf(4, "new input from %v for syscall %v (signal=%v, cover=%v)",
+diff --git a/vm/gvisor/gvisor.go b/vm/gvisor/gvisor.go
+index 4365c22f9..e1728df24 100644
+--- a/vm/gvisor/gvisor.go
++++ b/vm/gvisor/gvisor.go
+@@ -82,6 +82,7 @@ func (pool *Pool) Create(workdir string, index int) (vmimpl.Instance, error) {
+ 	rootDir := filepath.Clean(filepath.Join(workdir, "..", "gvisor_root"))
+ 	imageDir := filepath.Join(workdir, "image")
+ 	bundleDir := filepath.Join(workdir, "bundle")
++	os.RemoveAll(rootDir)
+ 	osutil.MkdirAll(rootDir)
+ 	osutil.MkdirAll(bundleDir)
+ 	osutil.MkdirAll(imageDir)
+@@ -93,7 +94,7 @@ func (pool *Pool) Create(workdir string, index int) (vmimpl.Instance, error) {
+ 		}
+ 		caps += "\"" + c + "\""
+ 	}
+-	vmConfig := fmt.Sprintf(configTempl, imageDir, caps)
++	vmConfig := fmt.Sprintf(configTempl, imageDir, caps, filepath.Clean(filepath.Join(workdir, "..")), index)
+ 	if err := osutil.WriteFile(filepath.Join(bundleDir, "config.json"), []byte(vmConfig)); err != nil {
+ 		return nil, err
+ 	}
+@@ -380,22 +381,41 @@ const initStartMsg = "SYZKALLER INIT STARTED\n"
+ 
+ const configTempl = `
+ {
+-	"root": {
+-		"path": "%[1]v",
+-		"readonly": true
+-	},
+-	"process":{
+-                "args": ["/init"],
+-                "cwd": "/tmp",
+-                "env": ["SYZ_GVISOR_PROXY=1"],
+-                "capabilities": {
+-                	"bounding": [%[2]v],
+-                	"effective": [%[2]v],
+-                	"inheritable": [%[2]v],
+-                	"permitted": [%[2]v],
+-                	"ambient": [%[2]v]
+-                }
+-	}
++    "root": {
++        "path": "%[1]v",
++        "readonly": false
++    },
++    "mounts": [{
++        "destination": "/workdir",
++        "type": "bind",
++        "source": "%[3]v",
++        "options": ["rbind", "rprivate"]
++    }],
++    "process":{
++        "args": ["/init"],
++        "cwd": "/tmp",
++        "env": ["SYZ_GVISOR_PROXY=1", "INDEX=%[4]v"],
++        "capabilities": {
++            "bounding": [%[2]v],
++            "effective": [%[2]v],
++            "inheritable": [%[2]v],
++            "permitted": [%[2]v],
++            "ambient": [%[2]v]
++        }
++    },
++    "linux": {
++      "resources": {
++          "memory": {
++            "limit": 4294967296,
++            "disableOOMKiller": false
++          },
++          "cpu": {
++            "shares": 0,
++            "quota": 100000,
++            "period": 100000
++          }
++      }
++    }
+ }
+ `
+ 
+-- 
+2.17.1
+
