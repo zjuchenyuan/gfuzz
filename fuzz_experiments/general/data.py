@@ -28,7 +28,7 @@ rawtext =[i for i in """
 0x4620116
 0x4220008
 """.strip().split("\n") if i]
-final1=dataset={}
+dataset={}
 for idx,line in enumerate(rawtext):
     l = line.split()
     pc = l[0]

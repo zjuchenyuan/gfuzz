@@ -1,0 +1,28 @@
+{
+    "name": "{name}",
+    "target": "linux/amd64",
+    "http": ":{randint}",
+    "workdir": "/g/output/{outfolder}/{name}",
+    "image": "{gvisor_folder}/runsc",
+    "kernel_obj": "{gvisor_folder}",
+    "kernel_src": "{gvisor_folder}",
+    "syzkaller": "{syzkaller_path}",
+    "cover": true,
+    "procs": 1,
+    "type": "gvisor",
+    "vm": {
+        "count": 1,
+        "runsc_args": "-platform=kvm -vfs2"
+    },
+    "distance": "{CONFFOLDER}{target}_aflgodis.json",
+    "random_choose": false,
+    "globaldistance": false,
+    "reproduce": false,
+    "limitexec": false,
+    "cooling_tx": 72000,
+    "useclosetdistance": false,
+    "mimicbaseline": false,
+    "disable_rotate": false,
+    "targetpc": {targetpc},
+    "syscallseeds": {syscallseeds}
+}

@@ -1,0 +1,19 @@
+{
+    "name": "{name}",
+    "target": "linux/amd64",
+    "http": ":{randint}",
+    "workdir": "/g/output/{outfolder}/{name}",
+    "image": "{gvisor_folder}/runsc",
+    "kernel_obj": "{gvisor_folder}",
+    "kernel_src": "{gvisor_folder}", 
+    "syzkaller": "{syzkaller_path}", 
+    "cover": true,
+    "procs": 1,
+    "type": "gvisor",
+    "vm": {
+        "count": 1,
+        "runsc_args": "-platform=kvm -vfs2"
+    },
+    "reproduce": false,
+    "targetpc": {targetpc}
+}
