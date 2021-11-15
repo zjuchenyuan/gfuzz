@@ -66,7 +66,7 @@ for BATCH, TARGETS in BATCH_SETTINGS.items():
                 open("start"+BATCH+".sh", "a").write("""NAME="%(NAME)s"
 mkdir -p /g/output/%(outfolder)s/${NAME}
 cd /g/output/%(outfolder)s/${NAME}/
-timeout -k 60 86400 %(syzkaller_path)s/bin/syz-manager -bench bench.log -config /g/conf/%(FOLDER)s/%(NAME)s.conf &
+timeout -k 60 86400 %(syzkaller_path)s/bin/syz-manager -bench bench.log -config /g/fuzz_experiments/%(FOLDER)s/%(NAME)s.conf &
 sleep 5
 """%(locals()))
 
@@ -93,7 +93,7 @@ sleep 5
                 open("start"+BATCH+".sh", "a").write("""NAME="%(NAME)s"
 mkdir -p /g/output/%(outfolder)s/${NAME}
 cd /g/output/%(outfolder)s/${NAME}/
-timeout -k 60 86400 %(syzkaller_path)s/bin/syz-manager -bench bench.log -config /g/conf/%(FOLDER)s/%(NAME)s.conf &
+timeout -k 60 86400 %(syzkaller_path)s/bin/syz-manager -bench bench.log -config /g/fuzz_experiments/%(FOLDER)s/%(NAME)s.conf &
 sleep 5
 """%(locals()))
 
