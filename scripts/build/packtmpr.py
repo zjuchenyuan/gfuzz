@@ -10,7 +10,7 @@ for i in os.listdir():
     if i in ["main#main.go", "main#version.go"]:
         continue
     code = open(i, "r").readlines()
-    code = [i for i in code if "github.com/bazelbuild/rules_go/go/tools/coverdata" not in i][:-6]
+    code = [i.replace('import "github.com/bazelbuild/rules_go/go/tools/coverdata"', '') for i in code][:-6]
     if code[0].startswith("//line"):
         code = code[1:]
     dst2="/tmp/r_"+NAME+"/"+i
