@@ -1,0 +1,133 @@
+From 2cbbec6aa3e49cd6e2e87acb568c84bfa2aa74fd Mon Sep 17 00:00:00 2001
+From: zjuchenyuan <zjuchenyuan.gfuzz@qiushi.ac.cn>
+Date: Mon, 14 Nov 2022 16:38:04 +0800
+Subject: [PATCH] [gfuzz-linux] more changes
+
+---
+ gfuzz/gfuzz.go       |  3 ++-
+ sys/sys.go           | 18 +++++++++---------
+ syz-fuzzer/fuzzer.go | 13 ++++++++-----
+ syz-fuzzer/proc.go   |  2 +-
+ 4 files changed, 20 insertions(+), 16 deletions(-)
+
+diff --git a/gfuzz/gfuzz.go b/gfuzz/gfuzz.go
+index b99542ec3..b7ae4359f 100644
+--- a/gfuzz/gfuzz.go
++++ b/gfuzz/gfuzz.go
+@@ -12,6 +12,7 @@ var Status string = ""
+ 
+ func initGFUZZlog() {
+ 	var err error
++err=os.MkdirAll("/workdir", os.ModePerm)
+ 	fGFUZZlog, err = os.OpenFile(fmt.Sprintf("/workdir/gfuzz_%v.log", os.Getenv("INDEX")), os.O_APPEND|os.O_WRONLY|os.O_CREATE, 0644)
+ 	if err != nil {
+ 		log.Fatalf("cannot write gfuzz log: %v", err)
+@@ -55,4 +56,4 @@ type RuleInferredSyscalls struct {
+ }
+ 
+ var RuleCalls []RuleInferredSyscalls
+-var UseRuleCall map[string]uint
+\ No newline at end of file
++var UseRuleCall map[string]uint
+diff --git a/sys/sys.go b/sys/sys.go
+index 9400df2f8..1bf8dcb34 100644
+--- a/sys/sys.go
++++ b/sys/sys.go
+@@ -5,14 +5,14 @@ package sys
+ 
+ import (
+ 	// Import all targets, so that users only need to import sys.
+-	_ "github.com/google/syzkaller/sys/akaros/gen"
+-	_ "github.com/google/syzkaller/sys/darwin/gen"
+-	_ "github.com/google/syzkaller/sys/freebsd/gen"
+-	_ "github.com/google/syzkaller/sys/fuchsia/gen"
++//	_ "github.com/google/syzkaller/sys/akaros/gen"
++//	_ "github.com/google/syzkaller/sys/darwin/gen"
++//	_ "github.com/google/syzkaller/sys/freebsd/gen"
++//	_ "github.com/google/syzkaller/sys/fuchsia/gen"
+ 	_ "github.com/google/syzkaller/sys/linux/gen"
+-	_ "github.com/google/syzkaller/sys/netbsd/gen"
+-	_ "github.com/google/syzkaller/sys/openbsd/gen"
+-	_ "github.com/google/syzkaller/sys/test/gen"
+-	_ "github.com/google/syzkaller/sys/trusty/gen"
+-	_ "github.com/google/syzkaller/sys/windows/gen"
++//	_ "github.com/google/syzkaller/sys/netbsd/gen"
++//	_ "github.com/google/syzkaller/sys/openbsd/gen"
++//	_ "github.com/google/syzkaller/sys/test/gen"
++//	_ "github.com/google/syzkaller/sys/trusty/gen"
++//	_ "github.com/google/syzkaller/sys/windows/gen"
+ )
+diff --git a/syz-fuzzer/fuzzer.go b/syz-fuzzer/fuzzer.go
+index 723fb41eb..49f0caa6c 100644
+--- a/syz-fuzzer/fuzzer.go
++++ b/syz-fuzzer/fuzzer.go
+@@ -21,6 +21,7 @@ import (
+ 	"time"
+ 
+ 	"github.com/google/syzkaller/gfuzz"
++	"github.com/google/syzkaller/pkg/cover"
+ 	"github.com/google/syzkaller/pkg/csource"
+ 	"github.com/google/syzkaller/pkg/hash"
+ 	"github.com/google/syzkaller/pkg/host"
+@@ -793,7 +794,9 @@ func (fuzzer *Fuzzer) addInputFromAnotherFuzzer(inp rpctype.Input) {
+ 	}
+ 	sig := hash.Hash(inp.Prog)
+ 	sign := inp.Signal.Deserialize()
+-	fuzzer.addInputToCorpus(p, sign, inp.ProgSig.Deserialize(), sig)
++	cover := new(cover.Cover)
++	cover.Merge(inp.Cover)
++	fuzzer.addInputToCorpus(p, sign, inp.ProgSig.Deserialize(), sig, *cover)
+ }
+ 
+ func (fuzzer *Fuzzer) addCandidateInput(candidate rpctype.Candidate) {
+@@ -936,7 +939,7 @@ func (fuzzer *Fuzzer) boundaryDeleteRoutine() {
+ 	}
+ }
+ 
+-func (fuzzer *Fuzzer) addInputToCorpus(p *prog.Prog, sign signal.Signal, progSig signal.Signal, sig hash.Sig) {
++func (fuzzer *Fuzzer) addInputToCorpus(p *prog.Prog, sign signal.Signal, progSig signal.Signal, sig hash.Sig, cover cover.Cover) {
+ 	fuzzer.corpusMu.Lock()
+ 	var newidx uint
+ 	var isnewseed bool
+@@ -954,14 +957,14 @@ func (fuzzer *Fuzzer) addInputToCorpus(p *prog.Prog, sign signal.Signal, progSig
+ 		fuzzer.seedProfit[p.Idx]++
+ 	}
+ 	for _, targetpc := range fuzzer.targetpc {
+-		if _, ok := progSig[targetpc]; ok {
++		if _, ok := cover[targetpc]; ok {
+ 			fuzzer.notifyTargetFound(targetpc)
+ 		}
+ 	}
+ 	if fuzzer.enableDistance {
+ 		var energysum, energycnt int64
+ 		seedClosestdistance := int64(1000)
+-		for i := range progSig {
++		for i := range cover {
+ 			d, ok := fuzzer.pc2distance[uint64(i)]
+ 			if ok {
+ 				energysum += d
+@@ -1029,7 +1032,7 @@ func (fuzzer *Fuzzer) addInputToCorpus(p *prog.Prog, sign signal.Signal, progSig
+ 		}
+ 	}
+ 	if fuzzer.enablePCCFG {
+-		for i := range progSig {
++		for i := range cover {
+ 			pc := uint32(i)
+ 			if _, ok := fuzzer.boundary[pc]; ok {
+ 				fuzzer.boundary[pc] = append(fuzzer.boundary[pc], int(newidx))
+diff --git a/syz-fuzzer/proc.go b/syz-fuzzer/proc.go
+index fc15f2231..3b56aa275 100644
+--- a/syz-fuzzer/proc.go
++++ b/syz-fuzzer/proc.go
+@@ -556,7 +556,7 @@ func (proc *Proc) triageInput(item *WorkTriage) {
+ 		Cover:   inputCover.Serialize(),
+ 	})
+ 
+-	proc.fuzzer.addInputToCorpus(item.p, inputSignal, progSig, sig)
++	proc.fuzzer.addInputToCorpus(item.p, inputSignal, progSig, sig, inputCover)
+ 	proc.newseeds++
+ 	proc.fuzzer.LastNewSeedTime = time.Now()
+ 
+-- 
+2.17.1
+
