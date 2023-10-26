@@ -1,6 +1,21 @@
 # gfuzz
 Directed fuzzing framework for gVisor.
 
+Paper PDF: [G-Fuzz_A_Directed_Fuzzing_Framework_for_gVisor.pdf](https://github.com/zjuchenyuan/gfuzz/files/13173783/G-Fuzz_A_Directed_Fuzzing_Framework_for_gVisor.pdf)
+
+
+Cite:
+
+```
+@article{li2023g,
+  title={G-Fuzz: A Directed Fuzzing Framework for gVisor},
+  author={Li, Yuwei and Chen, Yuan and Ji, Shouling and Zhang, Xuhong and Yan, Guanglu and Liu, Alex X and Wu, Chunming and Pan, Zulie and Lin, Peng},
+  journal={IEEE Transactions on Dependable and Secure Computing},
+  year={2023},
+  publisher={IEEE}
+}
+```
+
 ## Pipeline
 
 Note: We assume all gfuzz files placed under folder `/g` on the host machine.
